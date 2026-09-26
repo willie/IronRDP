@@ -1040,6 +1040,14 @@ impl GraphicsPipelineClient {
         } else {
             (None, Some(&stream.stream1))
         };
+        // Servers send the chroma view only when they can keep up (GNOME
+        // Remote Desktop drops it while frames await acknowledgement).
+        trace!(
+            surface_id,
+            main = luma.is_some(),
+            auxiliary = chroma.is_some(),
+            "AVC444v2 update"
+        );
         let luma = luma
             .map(|view| decoder.decode_yuv420(view.data).map(|frame| (frame, &view.rectangles)))
             .transpose()
