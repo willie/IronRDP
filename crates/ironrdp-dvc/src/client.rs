@@ -307,7 +307,9 @@ impl DrdynvcClient {
     }
 
     pub fn close_channel(&mut self, channel_id: u32) -> Option<SvcMessage> {
-        self.dynamic_channels.remove_by_channel_id(channel_id)?;
+        if !self.dynamic_channels.remove_by_channel_id(channel_id) {
+            return None;
+        }
         self.tunnel_channels.remove(&channel_id);
         Some(SvcMessage::from(DrdynvcClientPdu::Close(ClosePdu::new(channel_id))))
     }
@@ -493,7 +495,7 @@ impl SvcProcessor for DrdynvcClient {
             DrdynvcServerPdu::Close(close) => {
                 debug!("Got DVC Close PDU: {close:?}");
                 let channel_id = close.channel_id();
-                if self.dynamic_channels.remove_by_channel_id(channel_id).is_some() {
+                if self.dynamic_channels.remove_by_channel_id(channel_id) {
                     let close_response = DrdynvcClientPdu::Close(ClosePdu::new(channel_id));
                     debug!("Send DVC Close Response PDU: {close_response:?}");
                     responses.push(SvcMessage::from(close_response));
@@ -525,6 +527,9 @@ struct DynamicChannelSet {
     listeners: BTreeMap<DynamicChannelName, ListenerEntry>,
     active_channels: BTreeMap<DynamicChannelId, DynamicVirtualChannel>,
     type_id_to_channel_id: BTreeMap<TypeId, DynamicChannelId>,
+    /// Pre-registered channels that were closed, kept for the server to open again
+    /// (xrdp closes and reopens every channel after a Deactivation-Reactivation Sequence).
+    closed_channels: BTreeMap<TypeId, DynamicVirtualChannel>,
 }
 
 impl DynamicChannelSet {
@@ -534,6 +539,7 @@ impl DynamicChannelSet {
             listeners: BTreeMap::new(),
             active_channels: BTreeMap::new(),
             type_id_to_channel_id: BTreeMap::new(),
+            closed_channels: BTreeMap::new(),
         }
     }
 
@@ -580,13 +586,15 @@ impl DynamicChannelSet {
         channel_id: DynamicChannelId,
     ) -> Option<&mut DynamicVirtualChannel> {
         let entry = self.listeners.get_mut(name)?;
-        let processor = entry.listener.create(channel_id)?;
+        let dvc = match entry.listener.create(channel_id) {
+            Some(processor) => DynamicVirtualChannel::from_boxed(processor),
+            None => self.closed_channels.remove(&entry.type_id?)?,
+        };
 
         if let Some(type_id) = entry.type_id {
             self.type_id_to_channel_id.insert(type_id, channel_id);
         }
 
-        let dvc = DynamicVirtualChannel::from_boxed(processor);
         // `dvc.channel_id` stays `None` here — it is set by `DynamicVirtualChannel::start`
         // on success, so `Drop` only invokes `close` for channels that were actually opened.
         let dvc = match self.active_channels.entry(channel_id) {
@@ -624,17 +632,23 @@ impl DynamicChannelSet {
         self.active_channels.get_mut(&id)
     }
 
-    fn remove_by_channel_id(&mut self, id: DynamicChannelId) -> Option<DynamicVirtualChannel> {
-        self.active_channels.remove(&id).inspect(|dvc| {
-            let type_id = dvc.processor_type_id();
+    /// Closes and removes a channel, returning whether it was active.
+    fn remove_by_channel_id(&mut self, id: DynamicChannelId) -> bool {
+        let Some(mut dvc) = self.active_channels.remove(&id) else {
+            return false;
+        };
+        let type_id = dvc.processor_type_id();
 
-            // Only matters for pre-registered channels
-            if let alloc::collections::btree_map::Entry::Occupied(entry) = self.type_id_to_channel_id.entry(type_id)
-                && entry.get() == &id
-            {
-                entry.remove();
+        // Only matters for pre-registered channels
+        if self.type_id_to_channel_id.get(&type_id) == Some(&id) {
+            self.type_id_to_channel_id.remove(&type_id);
+            if let Some(id) = dvc.channel_id.take() {
+                dvc.channel_processor.close(id);
             }
-        })
+            dvc.complete_data = CompleteData::new();
+            self.closed_channels.insert(type_id, dvc);
+        }
+        true
     }
 
     #[inline]
@@ -680,6 +694,32 @@ mod tests {
         assert!(channels.has_listener_by_type_id(TypeId::of::<TestDvc>()));
         assert!(channels.try_create_channel(&"test".to_owned(), 1).is_some());
         assert!(!channels.has_listener_by_type_id(TypeId::of::<TestDvc>()));
+    }
+
+    #[test]
+    fn closed_pre_registered_channel_can_be_reopened() {
+        let mut channels = DynamicChannelSet::new();
+        channels.register_once(TestDvc);
+        channels
+            .try_create_channel(&"test".to_owned(), 1)
+            .unwrap()
+            .start(1)
+            .unwrap();
+
+        // xrdp closes and reopens the channel after a Deactivation-Reactivation Sequence.
+        assert!(channels.remove_by_channel_id(1));
+        assert!(channels.get_by_type_id(TypeId::of::<TestDvc>()).is_none());
+        channels
+            .try_create_channel(&"test".to_owned(), 2)
+            .expect("pre-registered channel reopened")
+            .start(2)
+            .unwrap();
+
+        assert!(channels.get_by_channel_id(1).is_none());
+        assert_eq!(
+            channels.get_by_type_id(TypeId::of::<TestDvc>()).unwrap().channel_id,
+            Some(2)
+        );
     }
 
     fn add_active_channel(client: &mut DrdynvcClient, channel_id: DynamicChannelId) {
