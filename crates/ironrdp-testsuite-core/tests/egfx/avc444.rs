@@ -152,13 +152,12 @@ fn main_view_alone_upsamples_chroma() {
 }
 
 #[test]
-fn main_view_region_past_the_right_edge_changes_nothing() {
-    // The region clamps to an empty one at the frame's right edge, which is
-    // odd here.
+fn region_past_the_right_edge_changes_nothing() {
+    // The region clamps to an empty one at the frame's right edge, which
+    // isn't a multiple of 4 here.
     let (y, u, v) = source_frame();
-    let (main, _) = split_v2(&y, &u, &v);
-    let (width, height) = (W - 7, H);
-    let mut frame = Yuv444Frame::new(width, height).expect("frame");
+    let (main, aux) = split_v2(&y, &u, &v);
+    let mut frame = Yuv444Frame::new(W - 7, H).expect("frame");
     let before = frame.clone();
 
     let past = [ExclusiveRectangle {
@@ -168,6 +167,9 @@ fn main_view_region_past_the_right_edge_changes_nothing() {
         bottom: u16::try_from(H).expect("fits"),
     }];
     frame.apply_main_view(&main.view(), &past).expect("main view");
+    frame
+        .apply_auxiliary_view_v2(&aux.view(), &past)
+        .expect("auxiliary view");
 
     assert_eq!(frame.y(), before.y());
     assert_eq!(frame.u(), before.u());

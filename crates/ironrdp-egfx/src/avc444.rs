@@ -201,8 +201,9 @@ impl Yuv444Frame {
                     quad[2] = at_2;
                 }
                 // The last group when the width isn't a multiple of 4, which
-                // may have no column 2.
-                if right % 4 != 0 {
+                // may have no column 2. A region clamped to an empty one at
+                // that edge covers no group.
+                if right % 4 != 0 && left < right {
                     let x = to;
                     self.u[dst + 4 * x] = aux.u[src_u + x];
                     self.v[dst + 4 * x] = aux.u[src_u + quarter + x];
