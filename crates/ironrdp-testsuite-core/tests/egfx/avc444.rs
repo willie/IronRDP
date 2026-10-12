@@ -152,6 +152,29 @@ fn main_view_alone_upsamples_chroma() {
 }
 
 #[test]
+fn main_view_region_past_the_right_edge_changes_nothing() {
+    // The region clamps to an empty one at the frame's right edge, which is
+    // odd here.
+    let (y, u, v) = source_frame();
+    let (main, _) = split_v2(&y, &u, &v);
+    let (width, height) = (W - 7, H);
+    let mut frame = Yuv444Frame::new(width, height).expect("frame");
+    let before = frame.clone();
+
+    let past = [ExclusiveRectangle {
+        left: u16::try_from(W).expect("fits"),
+        top: 0,
+        right: u16::try_from(W + 16).expect("fits"),
+        bottom: u16::try_from(H).expect("fits"),
+    }];
+    frame.apply_main_view(&main.view(), &past).expect("main view");
+
+    assert_eq!(frame.y(), before.y());
+    assert_eq!(frame.u(), before.u());
+    assert_eq!(frame.v(), before.v());
+}
+
+#[test]
 fn updates_stay_inside_their_regions() {
     let (y, u, v) = source_frame();
     let (main, aux) = split_v2(&y, &u, &v);
@@ -241,7 +264,7 @@ fn cropped_frame_reads_auxiliary_view_at_coded_width() {
     let (y, u, v) = source_frame();
     let (main, aux) = split_v2(&y, &u, &v);
 
-    for (width, height) in [(W - 6, H), (W - 7, H - 1)] {
+    for (width, height) in [(W - 6, H), (W - 7, H - 1), (W - 5, H)] {
         let region = [ExclusiveRectangle {
             left: 0,
             top: 0,
@@ -250,6 +273,13 @@ fn cropped_frame_reads_auxiliary_view_at_coded_width() {
         }];
         let mut frame = Yuv444Frame::new(width, height).expect("frame");
         frame.apply_main_view(&main.view(), &region).expect("main view");
+        for row in 0..height {
+            for col in 0..width {
+                let (i, j) = (row * width + col, row / 2 * (W / 2) + col / 2);
+                assert_eq!(frame.u()[i], main.u[j], "{width}x{height}: main U at ({col},{row})");
+                assert_eq!(frame.v()[i], main.v[j], "{width}x{height}: main V at ({col},{row})");
+            }
+        }
         frame
             .apply_auxiliary_view_v2(&aux.view(), &region)
             .expect("auxiliary view");
