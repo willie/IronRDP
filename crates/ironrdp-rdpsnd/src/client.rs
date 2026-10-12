@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
-use ironrdp_core::{Decode as _, Encode as _, EncodeResult, ReadCursor, cast_length, impl_as_any};
+use ironrdp_core::{Decode as _, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_size, impl_as_any};
+use ironrdp_dvc::{DvcClientProcessor, DvcEncode, DvcMessage, DvcProcessor};
 use ironrdp_pdu::gcc::ChannelName;
 use ironrdp_pdu::{PduResult, encode_err, pdu_other_err};
 use ironrdp_svc::{CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor};
@@ -358,3 +359,74 @@ impl Drop for Rdpsnd {
 }
 
 impl SvcClientProcessor for Rdpsnd {}
+
+/// Audio output over the dynamic virtual channel `AUDIO_PLAYBACK_DVC`
+/// ([MS-RDPEA] 2.1).
+///
+/// A server that supports it uses this channel instead of the static one when
+/// the client registers it; GNOME Remote Desktop and Windows do. The PDUs and
+/// their order are the static channel's, so this runs an [`Rdpsnd`] and sends
+/// its replies without static channel framing. Register it next to the static
+/// [`Rdpsnd`]; the server picks one.
+#[derive(Debug)]
+pub struct RdpsndDvc(Rdpsnd);
+
+impl RdpsndDvc {
+    pub const NAME: &'static str = "AUDIO_PLAYBACK_DVC";
+
+    pub fn new(handler: Box<dyn RdpsndClientHandler>) -> Self {
+        Self(Rdpsnd::new(handler))
+    }
+
+    #[must_use]
+    pub fn with_quality_mode(self, quality_mode: pdu::QualityMode) -> Self {
+        Self(self.0.with_quality_mode(quality_mode))
+    }
+}
+
+impl_as_any!(RdpsndDvc);
+
+impl DvcProcessor for RdpsndDvc {
+    fn channel_name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        Ok(Vec::new())
+    }
+
+    fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        self.0
+            .process(payload)?
+            .iter()
+            .map(|message| {
+                let pdu = message.encode_unframed_pdu().map_err(|e| encode_err!(e))?;
+                let message: DvcMessage = Box::new(EncodedPdu(pdu));
+                Ok(message)
+            })
+            .collect()
+    }
+}
+
+impl DvcClientProcessor for RdpsndDvc {}
+
+/// A PDU [`Rdpsnd`] already encoded.
+struct EncodedPdu(Vec<u8>);
+
+impl Encode for EncodedPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_slice(&self.0);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "ClientAudioOutputPdu"
+    }
+
+    fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl DvcEncode for EncodedPdu {}
