@@ -106,10 +106,10 @@ impl Yuv444Frame {
                 let dst = y * self.width;
                 self.y[dst + left..dst + right].copy_from_slice(&main.y[src + left..src + right]);
             }
-            // Row slices rather than per-sample indexing, so the loops
-            // vectorize. `left` is a macroblock edge unless the region is
-            // empty; when the frame width is odd, the last column is a block
-            // of its own.
+            // Row slices rather than per-sample indexing: bounds are checked
+            // once per row, with no division per sample. `left` is a
+            // macroblock edge unless the region is empty; when the frame width
+            // is odd, the last column is a block of its own.
             let (from, to) = (left / 2, right / 2);
             for y in top..bottom {
                 let (src_u, src_v) = ((y / 2) * main.u_stride, (y / 2) * main.v_stride);
