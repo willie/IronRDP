@@ -91,6 +91,11 @@ impl DvcProcessor for DisplayControlClient {
         self.ready = true;
         (self.on_capabilities_received)(caps)
     }
+
+    fn close(&mut self, _channel_id: u32) {
+        // A server can open the channel again; it is ready once it sends caps.
+        self.ready = false;
+    }
 }
 
 impl DvcClientProcessor for DisplayControlClient {}
