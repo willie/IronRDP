@@ -53,8 +53,8 @@
 //! [3.3.5.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/90aba3e3-d4a8-4af1-b1bb-a94e2313bbf0
 //! [3.3.5.12]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/e3c80bff-3e4e-4e65-b7c2-c2cd6b1fb4f5
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashSet};
 
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
@@ -854,10 +854,16 @@ impl GraphicsPipelineClient {
                 self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
             }
             Codec1Type::Avc444v2 => {
-                self.decode_avc444v2(pdu.surface_id, &pdu.bitmap_data)?;
+                let surface_size = (surface.width, surface.height);
+                self.decode_avc444v2(pdu.surface_id, surface_size, &pdu.bitmap_data)?;
             }
             Codec1Type::Avc444 => {
-                debug!("AVC444 (v1 layout) not yet implemented, forwarding to handler");
+                // A server that confirmed a V10.x set may send the v1 layout;
+                // the region stays stale, so leave a trace.
+                warn!(
+                    surface_id = pdu.surface_id,
+                    "AVC444 (v1 layout) not yet implemented, forwarding to handler"
+                );
                 self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
             }
             Codec1Type::ClearCodec => {
@@ -1097,7 +1103,12 @@ impl GraphicsPipelineClient {
     /// Both views go through the one H.264 decoder in order, as MS-RDPEGFX
     /// 2.2.4.5 requires ("decoded by a single MPEG-4 AVC/H.264 decoder as one
     /// stream"), and are combined into the surface's persistent YUV444 frame.
-    fn decode_avc444v2(&mut self, surface_id: u16, bitmap_data: &[u8]) -> PduResult<()> {
+    fn decode_avc444v2(
+        &mut self,
+        surface_id: u16,
+        (surface_width, surface_height): (u16, u16),
+        bitmap_data: &[u8],
+    ) -> PduResult<()> {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc444BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
@@ -1189,15 +1200,16 @@ impl GraphicsPipelineClient {
         // The frame is current only inside the regions this PDU updated, so
         // paint just those. Region rectangles are in surface coordinates, with
         // the picture's top-left at the surface origin, as FreeRDP reads them.
-        let surface = self
-            .surfaces
-            .get(&surface_id)
-            .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface1"))?;
         let (max_right, max_bottom) = (
-            surface.width.min(u16::try_from(width).unwrap_or(u16::MAX)),
-            surface.height.min(u16::try_from(height).unwrap_or(u16::MAX)),
+            surface_width.min(u16::try_from(width).unwrap_or(u16::MAX)),
+            surface_height.min(u16::try_from(height).unwrap_or(u16::MAX)),
         );
-        let mut painted: Vec<ExclusiveRectangle> = Vec::new();
+        if luma.iter().chain(chroma.iter()).all(|(_, regions)| regions.is_empty()) {
+            // Unlike AVC420, there is no destination-rectangle fallback: the
+            // regions also bound what the views wrote into the frame.
+            warn!(surface_id, "AVC444v2 update with no regionRects -- nothing painted");
+        }
+        let mut painted = HashSet::new();
         let regions = luma.iter().chain(chroma.iter()).flat_map(|(_, regions)| regions.iter());
         for region in regions {
             let rect = ExclusiveRectangle {
@@ -1222,7 +1234,7 @@ impl GraphicsPipelineClient {
                 continue;
             }
             // Both views usually list the same regions; paint each once.
-            if painted.contains(&rect) {
+            if !painted.insert((rect.left, rect.top, rect.right, rect.bottom)) {
                 continue;
             }
             let data = frame
@@ -1238,7 +1250,6 @@ impl GraphicsPipelineClient {
             };
             self.compositor.apply_bitmap(surface_id, &rect, &update.data);
             self.handler.on_bitmap_updated(&update);
-            painted.push(rect);
         }
         Ok(())
     }
