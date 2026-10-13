@@ -687,9 +687,10 @@ impl DynamicChannelSet {
     }
 
     fn has_listener_by_type_id(&self, type_id: TypeId) -> bool {
-        self.listeners
-            .values()
-            .any(|entry| entry.type_id == Some(type_id) && entry.listener.is_available())
+        self.listeners.values().any(|entry| {
+            entry.type_id == Some(type_id)
+                && (entry.listener.is_available() || self.closed_channels.contains_key(&type_id))
+        })
     }
 
     fn get_by_channel_id(&self, id: DynamicChannelId) -> Option<&DynamicVirtualChannel> {
