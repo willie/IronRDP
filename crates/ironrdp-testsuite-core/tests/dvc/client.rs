@@ -1,8 +1,8 @@
 use ironrdp_core::{encode_vec, impl_as_any};
 use ironrdp_dvc::ironrdp_pdu::{PduResult, pdu_other_err};
 use ironrdp_dvc::pdu::{
-    DataPdu, DrdynvcClientPdu, DrdynvcDataPdu, DrdynvcServerPdu, SoftSyncChannelList, SoftSyncRequestPdu,
-    SoftSyncTunnelType,
+    ClosePdu, CreateRequestPdu, DataPdu, DrdynvcClientPdu, DrdynvcDataPdu, DrdynvcServerPdu, SoftSyncChannelList,
+    SoftSyncRequestPdu, SoftSyncTunnelType,
 };
 use ironrdp_dvc::{DrdynvcClient, DvcClientProcessor, DvcMessage, DvcMessageBatch, DvcProcessor};
 use ironrdp_svc::SvcMessage;
@@ -109,6 +109,32 @@ fn failed_established_dynamic_channel_attachment_is_not_registered() {
             .attach_established_dynamic_channel(7, RecordedDvc::default())
             .is_ok()
     );
+}
+
+#[test]
+fn closed_pre_registered_channel_stays_registered_for_reopening() {
+    // xrdp closes and reopens every channel after a Deactivation-Reactivation Sequence.
+    let mut client = DrdynvcClient::new().with_dynamic_channel(RecordedDvc::default());
+    let create = |channel_id| {
+        encode_vec(&DrdynvcServerPdu::Create(CreateRequestPdu::new(
+            channel_id,
+            "recorded".to_owned(),
+        )))
+        .expect("Create Request should encode")
+    };
+    client.process(&create(1)).expect("Create Request should be processed");
+    let close = encode_vec(&DrdynvcServerPdu::Close(ClosePdu::new(1))).expect("Close should encode");
+    client.process(&close).expect("Close should be processed");
+
+    assert!(client.get_dvc::<RecordedDvc>().is_none());
+    assert!(
+        client.has_registered_dvc::<RecordedDvc>(),
+        "a closed pre-registered channel can still be opened"
+    );
+
+    client.process(&create(2)).expect("Create Request should be processed");
+    let channel = client.get_dvc::<RecordedDvc>().expect("channel reopened");
+    assert_eq!(channel.processor().started_with, Some(2));
 }
 
 #[test]
