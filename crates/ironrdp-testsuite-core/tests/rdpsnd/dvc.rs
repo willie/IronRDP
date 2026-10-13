@@ -98,3 +98,33 @@ fn plays_audio_over_the_dynamic_channel() {
     ));
     assert_eq!(*waves.lock().unwrap(), [vec![1, 2, 3, 4]]);
 }
+
+/// A server can close the channel and open it again, as xrdp does after a
+/// resize. The reopened channel starts over with the server's formats, even if
+/// the old one closed partway through negotiation.
+#[test]
+fn reopened_channel_negotiates_again() {
+    let mut client = RdpsndDvc::new(Box::new(Waves {
+        formats: [pcm()],
+        received: Arc::new(Mutex::new(Vec::new())),
+    }));
+    let formats = encode_vec(&pdu::ServerAudioOutputPdu::AudioFormat(pdu::ServerAudioFormatPdu {
+        version: pdu::Version::V8,
+        formats: vec![pcm()],
+    }))
+    .unwrap();
+    client.start(7).unwrap();
+    client.process(7, &formats).unwrap();
+    // Closed while waiting for training.
+    client.close(7);
+
+    client.start(9).unwrap();
+    let replies = responses(client.process(9, &formats).unwrap());
+    assert!(
+        matches!(
+            replies.as_slice(),
+            [pdu::ClientAudioOutputPdu::AudioFormat(f), pdu::ClientAudioOutputPdu::QualityMode(_)] if f.formats == [pcm()]
+        ),
+        "the reopened channel didn't answer the server's formats: {replies:?}"
+    );
+}
