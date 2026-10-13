@@ -406,6 +406,13 @@ impl DvcProcessor for RdpsndDvc {
             })
             .collect()
     }
+
+    fn close(&mut self, _channel_id: u32) {
+        // A server can open the channel again; it starts over with its formats.
+        self.0.handler.close();
+        self.0.state = RdpsndState::Start;
+        self.0.pending_wave = None;
+    }
 }
 
 impl DvcClientProcessor for RdpsndDvc {}
