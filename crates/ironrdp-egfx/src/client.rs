@@ -1120,7 +1120,7 @@ impl GraphicsPipelineClient {
             surface_id,
             main = luma.is_some(),
             auxiliary = chroma.is_some(),
-            "AVC444v2 update"
+            "AVC444 update"
         );
         let luma = luma
             .map(|view| decoder.decode_yuv420(view.data).map(|frame| (frame, &view.rectangles)))
