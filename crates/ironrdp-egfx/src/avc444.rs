@@ -24,6 +24,8 @@ use crate::decode::{DecoderError, DecoderResult};
 /// Borrowed planes of a decoded YUV420p frame (8-bit, 4:2:0).
 #[derive(Debug, Clone, Copy)]
 pub struct Yuv420Planes<'a> {
+    /// Width of the decoded picture, after any cropping.
+    pub width: u32,
     pub y: &'a [u8],
     pub y_stride: usize,
     pub u: &'a [u8],
@@ -52,7 +54,8 @@ impl core::fmt::Debug for Yuv444Frame {
 }
 
 impl Yuv444Frame {
-    /// Create a frame the size of the decoded views, after any cropping.
+    /// Create a frame of the area to keep: the decoded views clipped to
+    /// what can be painted.
     pub fn new(width: usize, height: usize) -> DecoderResult<Self> {
         if width == 0 || height == 0 {
             return Err(DecoderError::msg("AVC444 frame is empty"));
@@ -144,10 +147,16 @@ impl Yuv444Frame {
     ///   rows further for V.
     /// - Auxiliary U and V: U and V at odd columns of even rows.
     ///
-    /// For a frame cropped to a height that isn't a multiple of 16, the last
-    /// block reaches past the cropped height. Odd rows stored past the end of
-    /// the decoded plane keep the main view's chroma, as in FreeRDP; OpenH264's
-    /// planes stop at the cropped height.
+    /// The blocks are of the view, which may be larger than the frame. For a
+    /// view cropped to a height that isn't a multiple of 16, the last block
+    /// reaches past the cropped height. Odd rows whose V is stored past the
+    /// end of the decoded plane keep the main view's chroma; OpenH264's planes
+    /// stop at the cropped height.
+    ///
+    /// FreeRDP's `general_ChromaV1ToYUV444` keeps the main view's chroma for
+    /// more rows: it reads only rows inside each region rectangle, with blocks
+    /// counted from the region's top, so any odd row whose V is stored at or
+    /// past a region's bottom keeps it.
     pub fn apply_auxiliary_view_v1(
         &mut self,
         aux: &Yuv420Planes<'_>,
@@ -199,14 +208,17 @@ impl Yuv444Frame {
     ///   quarter: V.
     ///
     /// The halves and quarters are of the coded width, before cropping. It
-    /// is taken as the frame width rounded up to a whole macroblock, as an
-    /// encoder pads a frame for H.264 and crops the padding off.
+    /// is taken as the view's width rounded up to a whole macroblock, as an
+    /// encoder pads a frame for H.264 and crops the padding off. The frame
+    /// may be narrower than the view.
     pub fn apply_auxiliary_view_v2(
         &mut self,
         aux: &Yuv420Planes<'_>,
         regions: &[ExclusiveRectangle],
     ) -> DecoderResult<()> {
-        let coded_width = self.width.next_multiple_of(16);
+        let coded_width = usize::try_from(aux.width)
+            .map_err(|_| DecoderError::msg("AVC444 view too wide"))?
+            .next_multiple_of(16);
         let (half, quarter) = (coded_width / 2, coded_width / 4);
         check_planes(
             aux,
