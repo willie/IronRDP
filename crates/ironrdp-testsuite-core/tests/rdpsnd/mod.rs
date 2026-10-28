@@ -1,6 +1,9 @@
 mod client;
+mod codec;
 mod dvc;
+mod playout;
 mod server;
+mod transport;
 
 use std::borrow::Cow;
 

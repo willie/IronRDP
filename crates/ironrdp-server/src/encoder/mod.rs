@@ -24,6 +24,9 @@ use crate::{ColorPointer, DisplayUpdate, Framebuffer, LargePointer, RGBAPointer}
 
 mod bitmap;
 mod fast_path;
+mod pointer_mask;
+#[cfg(feature = "qoiz")]
+pub(crate) mod qoiz;
 pub(crate) mod rfx;
 
 pub(crate) use fast_path::*;
@@ -45,10 +48,10 @@ impl CodecId {
     }
 }
 
-#[cfg_attr(feature = "__bench", visibility::make(pub))]
+#[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
 #[derive(Debug)]
 pub(crate) struct UpdateEncoderCodecs {
-    remotefx: Option<(EntropyBits, u8)>,
+    remotefx: Option<(EntropyBits, u8, RemoteFxCodec)>,
     /// Quantization values for the RemoteFX encoder. Independent of
     /// `remotefx` (entropy coder + codec id, negotiated from the client's
     /// capabilities) because this is server-chosen, not client-negotiated:
@@ -64,7 +67,7 @@ pub(crate) struct UpdateEncoderCodecs {
 }
 
 impl UpdateEncoderCodecs {
-    #[cfg_attr(feature = "__bench", visibility::make(pub))]
+    #[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
     pub(crate) fn new() -> Self {
         Self {
             remotefx: None,
@@ -78,13 +81,14 @@ impl UpdateEncoderCodecs {
         }
     }
 
-    #[cfg_attr(feature = "__bench", visibility::make(pub))]
-    pub(crate) fn set_remotefx(&mut self, remotefx: Option<(EntropyBits, u8)>) {
+    /// Selects the RemoteFX codec the client listed, with its entropy coder and codec id.
+    #[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
+    pub(crate) fn set_remotefx_codec(&mut self, remotefx: Option<(EntropyBits, u8, RemoteFxCodec)>) {
         self.remotefx = remotefx
     }
 
     /// Set the quantization values the RemoteFX encoder uses once selected.
-    /// Has no effect unless `set_remotefx` also selects RemoteFX; kept
+    /// Has no effect unless `set_remotefx_codec` also selects RemoteFX; kept
     /// separate because quantization is server policy, not part of codec
     /// selection.
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
@@ -119,7 +123,7 @@ impl Default for UpdateEncoderCodecs {
     }
 }
 
-#[cfg_attr(feature = "__bench", visibility::make(pub))]
+#[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
 pub(crate) struct UpdateEncoder {
     desktop_size: DesktopSize,
     framebuffer: Option<Framebuffer>,
@@ -150,7 +154,7 @@ impl fmt::Debug for UpdateEncoder {
 }
 
 impl UpdateEncoder {
-    #[cfg_attr(feature = "__bench", visibility::make(pub))]
+    #[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
     pub(crate) fn new(
         desktop_size: DesktopSize,
         surface_flags: CmdFlags,
@@ -166,10 +170,13 @@ impl UpdateEncoder {
                 #[cfg(feature = "qoi")]
                 UpdateEncoderCodecs { qoi: Some(id), .. } => BitmapUpdater::Qoi(QoiHandler::new(id)),
                 UpdateEncoderCodecs {
-                    remotefx: Some((algo, id)),
+                    remotefx: Some((algo, id, codec)),
                     remotefx_quant,
                     ..
-                } => BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, remotefx_quant, id, desktop_size)),
+                } => {
+                    let command = codec.surface_bits_command(surface_flags);
+                    BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, remotefx_quant, id, desktop_size, command))
+                }
                 // NSCodec is the lowest-priority codec because it predates
                 // RemoteFX and produces larger output. It's relevant mainly
                 // for clients (notably macOS Microsoft Remote Desktop /
@@ -225,7 +232,7 @@ impl UpdateEncoder {
             .contains(LargePointerSupportFlags::UP_TO_384X384_PIXELS)
     }
 
-    #[cfg_attr(feature = "__bench", visibility::make(pub))]
+    #[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
     pub(crate) fn update(&mut self, update: DisplayUpdate) -> EncoderIter<'_> {
         EncoderIter {
             encoder: self,
@@ -243,6 +250,7 @@ impl UpdateEncoder {
 
     fn rgba_pointer(ptr: RGBAPointer) -> ServerResult<UpdateFragmenter> {
         let xor_mask = ptr.data;
+        let and_mask = pointer_mask::and_mask_from_alpha(&xor_mask, ptr.width, ptr.height);
 
         let hot_spot = Point16 {
             x: ptr.hot_x,
@@ -254,7 +262,7 @@ impl UpdateEncoder {
             width: ptr.width,
             height: ptr.height,
             xor_mask: &xor_mask,
-            and_mask: &[],
+            and_mask: &and_mask,
         };
         let ptr = PointerAttribute {
             xor_bpp: 32,
@@ -268,6 +276,7 @@ impl UpdateEncoder {
 
     fn large_pointer(ptr: LargePointer) -> ServerResult<UpdateFragmenter> {
         let xor_mask = ptr.data;
+        let and_mask = pointer_mask::and_mask_from_alpha(&xor_mask, ptr.width, ptr.height);
 
         let hot_spot = Point16 {
             x: ptr.hot_x,
@@ -280,7 +289,7 @@ impl UpdateEncoder {
             width: ptr.width,
             height: ptr.height,
             xor_mask: &xor_mask,
-            and_mask: &[],
+            and_mask: &and_mask,
         };
         Ok(UpdateFragmenter::new(
             UpdateCode::LargePointer,
@@ -453,14 +462,14 @@ enum State {
     Ended,
 }
 
-#[cfg_attr(feature = "__bench", visibility::make(pub))]
+#[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
 pub(crate) struct EncoderIter<'a> {
     encoder: &'a mut UpdateEncoder,
     state: State,
 }
 
 impl EncoderIter<'_> {
-    #[cfg_attr(feature = "__bench", visibility::make(pub))]
+    #[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
     pub(crate) async fn next(&mut self) -> Option<ServerResult<UpdateFragmenter>> {
         loop {
             let state = core::mem::take(&mut self.state);
@@ -709,19 +718,75 @@ impl BitmapUpdateHandler for BitmapHandler {
     }
 }
 
+/// A RemoteFX codec GUID from the client's [2.2.7.2.10.1.1] Bitmap Codec (TS_BITMAPCODEC) list.
+///
+/// [2.2.7.2.10.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/86507fed-a0ee-4242-b802-237534a8f65e
+#[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteFxCodec {
+    /// `CODEC_GUID_REMOTEFX`
+    RemoteFx,
+    /// `CODEC_GUID_IMAGE_REMOTEFX`
+    ImageRemoteFx,
+}
+
+impl RemoteFxCodec {
+    /// The surface command that carries this codec's data.
+    ///
+    /// [3.1.8.3.1] Encode Message Sequencing puts a RemoteFX stream in a Stream Surface Bits
+    /// command; it is sent when the client sets `STREAM_SURFACE_BITS` in its [2.2.7.2.9]
+    /// Surface Commands Capability Set (TS_SURFCMDS_CAPABILITYSET). Windows 10 mstsc shows a
+    /// black session when RemoteFX data comes in a Set Surface Bits command, and reports an
+    /// internal error when ImageRemoteFX data comes in a Stream Surface Bits command, so
+    /// ImageRemoteFX keeps Set Surface Bits. A client that does not set `STREAM_SURFACE_BITS`
+    /// also keeps getting RemoteFX data in Set Surface Bits, as before this command choice.
+    ///
+    /// [3.1.8.3.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/028ed301-385c-4b17-84ec-0a158a22c1b2
+    /// [2.2.7.2.9]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/aa953018-c0a8-4761-bb12-86586c2cd56a
+    fn surface_bits_command(self, surface_flags: CmdFlags) -> SurfaceBitsCommand {
+        match self {
+            Self::RemoteFx if surface_flags.contains(CmdFlags::STREAM_SURFACE_BITS) => SurfaceBitsCommand::Stream,
+            Self::RemoteFx | Self::ImageRemoteFx => SurfaceBitsCommand::Set,
+        }
+    }
+}
+
+/// The command that carries bitmap data, one of the [2.2.9.2] Surface Commands.
+///
+/// [2.2.9.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/397d6c54-a897-498d-933b-300fed41ec8c
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceBitsCommand {
+    /// [2.2.9.2.1] Set Surface Bits Command (TS_SURFCMD_SET_SURF_BITS)
+    ///
+    /// [2.2.9.2.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/776dbdaf-7619-45fd-9a90-ebfd07802b24
+    Set,
+    /// [2.2.9.2.2] Stream Surface Bits Command (TS_SURFCMD_STREAM_SURF_BITS)
+    ///
+    /// [2.2.9.2.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/b2218638-3cf9-4f2f-be61-b096ec3c8dc5
+    Stream,
+}
+
 #[derive(Debug, Clone)]
 struct RemoteFxHandler {
     remotefx: RfxEncoder,
     codec_id: u8,
     desktop_size: Option<DesktopSize>,
+    command: SurfaceBitsCommand,
 }
 
 impl RemoteFxHandler {
-    fn new(algo: EntropyBits, quant: Quant, codec_id: u8, desktop_size: DesktopSize) -> Self {
+    fn new(
+        algo: EntropyBits,
+        quant: Quant,
+        codec_id: u8,
+        desktop_size: DesktopSize,
+        command: SurfaceBitsCommand,
+    ) -> Self {
         Self {
             remotefx: RfxEncoder::new(algo, quant),
             desktop_size: Some(desktop_size),
             codec_id,
+            command,
         }
     }
 
@@ -749,7 +814,7 @@ impl BitmapUpdateHandler for RemoteFxHandler {
             }
         };
 
-        set_surface(bitmap, self.codec_id, &buffer[..len])
+        surface_bits(bitmap, self.codec_id, &buffer[..len], self.command)
     }
 }
 
@@ -777,7 +842,7 @@ impl BitmapUpdateHandler for QoiHandler {
 #[cfg(feature = "qoiz")]
 struct QoizHandler {
     codec_id: u8,
-    zctxt: zstd_safe::CCtx<'static>,
+    compressor: qoiz::Compressor,
 }
 
 #[cfg(feature = "qoiz")]
@@ -790,32 +855,10 @@ impl fmt::Debug for QoizHandler {
 #[cfg(feature = "qoiz")]
 impl QoizHandler {
     fn new(codec_id: u8) -> ServerResult<Self> {
-        let mut zctxt = zstd_safe::CCtx::default();
-
-        zctxt
-            .set_parameter(zstd_safe::CParameter::CompressionLevel(3))
-            .map_err(|code| {
-                ServerError::reason(
-                    "qoiz init",
-                    format!(
-                        "failed to set zstd compression level: {}",
-                        zstd_safe::get_error_name(code)
-                    ),
-                )
-            })?;
-        zctxt
-            .set_parameter(zstd_safe::CParameter::EnableLongDistanceMatching(true))
-            .map_err(|code| {
-                ServerError::reason(
-                    "qoiz init",
-                    format!(
-                        "failed to set zstd enable long distance matching: {}",
-                        zstd_safe::get_error_name(code)
-                    ),
-                )
-            })?;
-
-        Ok(Self { codec_id, zctxt })
+        Ok(Self {
+            codec_id,
+            compressor: qoiz::Compressor::new()?,
+        })
     }
 }
 
@@ -823,34 +866,9 @@ impl QoizHandler {
 impl BitmapUpdateHandler for QoizHandler {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
         let qoi = qoi_encode(bitmap)?;
-        let mut inb = zstd_safe::InBuffer::around(&qoi);
-        let mut data = vec![0; qoi.len()];
-        let mut outb;
-        let mut pos = 0;
+        let data = self.compressor.compress(&qoi)?;
 
-        loop {
-            outb = zstd_safe::OutBuffer::around_pos(data.as_mut_slice(), pos);
-            let res = self
-                .zctxt
-                .compress_stream2(
-                    &mut outb,
-                    &mut inb,
-                    zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_flush,
-                )
-                .map_err(|code| {
-                    ServerError::reason(
-                        "qoiz compress",
-                        format!("failed to Zstd compress: {}", zstd_safe::get_error_name(code)),
-                    )
-                })?;
-            if res == 0 {
-                break;
-            }
-            pos = outb.pos();
-            data.resize(data.len() + res, 0);
-        }
-
-        set_surface(bitmap, self.codec_id, outb.as_slice())
+        set_surface(bitmap, self.codec_id, &data)
     }
 }
 
@@ -919,6 +937,15 @@ fn qoi_encode(bitmap: &BitmapUpdate) -> ServerResult<Vec<u8>> {
 }
 
 fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> ServerResult<UpdateFragmenter> {
+    surface_bits(bitmap, codec_id, data, SurfaceBitsCommand::Set)
+}
+
+fn surface_bits(
+    bitmap: &BitmapUpdate,
+    codec_id: u8,
+    data: &[u8],
+    command: SurfaceBitsCommand,
+) -> ServerResult<UpdateFragmenter> {
     let destination = ExclusiveRectangle {
         left: bitmap.x,
         top: bitmap.y,
@@ -937,7 +964,10 @@ fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> ServerResult
         destination,
         extended_bitmap_data,
     };
-    let cmd = SurfaceCommand::SetSurfaceBits(pdu);
+    let cmd = match command {
+        SurfaceBitsCommand::Set => SurfaceCommand::SetSurfaceBits(pdu),
+        SurfaceBitsCommand::Stream => SurfaceCommand::StreamSurfaceBits(pdu),
+    };
     Ok(UpdateFragmenter::new(
         UpdateCode::SurfaceCommands,
         encode_vec(&cmd).map_err(ServerError::encode)?,

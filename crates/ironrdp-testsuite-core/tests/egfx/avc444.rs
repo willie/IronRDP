@@ -1,954 +1,709 @@
-use ironrdp_egfx::avc444::{Yuv420Planes, Yuv444Frame};
-use ironrdp_egfx::decode::DecoderResult;
+//! AVC444 and AVC444v2 decoding, from the server's sub-streams to the client's output.
+//!
+//! The views travel through a decoder that returns the planes it was given, so the tests check the
+//! view packing, the stream handling and the color conversion without H.264 quantization.
+
+use ironrdp_core::encode_vec;
+use ironrdp_dvc::{DvcMessage, DvcProcessor as _};
+use ironrdp_egfx::avc444::{Avc444Layout, Yuv444Frame};
+use ironrdp_egfx::client::GraphicsPipelineClient;
+use ironrdp_egfx::decode::{DecodedFrame, DecoderError, DecoderResult, H264Decoder, Yuv420Frame};
+use ironrdp_egfx::pdu::{Avc420Region, CapabilitiesAdvertisePdu, CapabilitySet, Encoding};
+use ironrdp_egfx::server::GraphicsPipelineServer;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
+use rstest::rstest;
 
-const W: usize = 64;
-const H: usize = 48;
+/// Neither dimension is a whole number of macroblocks, so the views carry padding.
+const WIDTH: u16 = 40;
+const HEIGHT: u16 = 24;
 
-/// A YUV444 source frame with distinct values in every plane and position.
-fn source_frame() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let mut y = vec![0u8; W * H];
-    let mut u = vec![0u8; W * H];
-    let mut v = vec![0u8; W * H];
-    for row in 0..H {
-        for col in 0..W {
-            let i = row * W + col;
-            y[i] = u8::try_from((row * 7 + col * 3) % 256).expect("fits");
-            u[i] = u8::try_from((row * 11 + col * 5 + 17) % 256).expect("fits");
-            v[i] = u8::try_from((row * 13 + col * 9 + 101) % 256).expect("fits");
+/// Largest per-channel difference the integer color transforms of MS-RDPEGFX 3.3.8.3.1 leave
+/// after a round trip.
+const TOLERANCE: u8 = 4;
+
+// ============================================================================
+// Plane-transport decoder
+// ============================================================================
+
+/// A decoder whose bitstream is the view itself, as written by [`pack`].
+struct PlaneDecoder;
+
+impl H264Decoder for PlaneDecoder {
+    fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
+        self.decode_yuv420(data).map(|view| view.to_rgba())
+    }
+
+    fn decode_yuv420(&mut self, data: &[u8]) -> DecoderResult<Yuv420Frame> {
+        let header = data.get(..4).ok_or_else(|| DecoderError::msg("missing view header"))?;
+        let width = u16::from_le_bytes([header[0], header[1]]);
+        let height = u16::from_le_bytes([header[2], header[3]]);
+        let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+        let luma_size = usize::from(width) * usize::from(height);
+        let chroma_size = usize::from(chroma_width) * usize::from(chroma_height);
+        let planes = &data[4..];
+        if planes.len() != luma_size + 2 * chroma_size {
+            return Err(DecoderError::msg("view size mismatch"));
+        }
+        let (y, chroma) = planes.split_at(luma_size);
+        let (u, v) = chroma.split_at(chroma_size);
+        Yuv420Frame::new(
+            width,
+            height,
+            y.to_vec(),
+            usize::from(width),
+            u.to_vec(),
+            v.to_vec(),
+            usize::from(chroma_width),
+        )
+    }
+
+    fn supports_yuv420(&self) -> bool {
+        true
+    }
+}
+
+fn pack(view: &Yuv420Frame) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&view.width().to_le_bytes());
+    data.extend_from_slice(&view.height().to_le_bytes());
+    for row in (0..).map_while(|row| view.luma_row(row)) {
+        data.extend_from_slice(row);
+    }
+    for row in (0..).map_while(|row| view.u_row(row)) {
+        data.extend_from_slice(row);
+    }
+    for row in (0..).map_while(|row| view.v_row(row)) {
+        data.extend_from_slice(row);
+    }
+    data
+}
+
+// ============================================================================
+// Pictures
+// ============================================================================
+
+/// A per-pixel checkerboard of two colors, which 4:2:0 subsampling cannot keep.
+///
+/// The pair changes every eight pixels, so the picture also has large-scale structure. Each pair
+/// differs enough in both U and V that the reverse chroma filter of MS-RDPEGFX 3.3.8.3.2 applies
+/// rather than keeping the subsampled value.
+fn checkerboard(seed: usize) -> Vec<u8> {
+    checkerboard_of(seed, usize::from(WIDTH), usize::from(HEIGHT))
+}
+
+fn checkerboard_of(seed: usize, width: usize, height: usize) -> Vec<u8> {
+    const PAIRS: [[[u8; 3]; 2]; 4] = [
+        [[220, 30, 40], [20, 70, 230]],
+        [[30, 200, 40], [200, 40, 220]],
+        [[240, 220, 30], [20, 150, 170]],
+        [[250, 120, 20], [40, 90, 250]],
+    ];
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let pair = PAIRS[(x / 8 + y / 8 + seed) % PAIRS.len()];
+            rgba.extend_from_slice(&pair[(x + y) % 2]);
+            rgba.push(0xFF);
         }
     }
-    (y, u, v)
+    rgba
 }
 
-/// Owned YUV420p planes with strides equal to their widths.
-struct Planes420 {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
+fn max_difference(actual: &[u8], expected: &[u8]) -> u8 {
+    assert_eq!(actual.len(), expected.len(), "pictures differ in size");
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| actual.abs_diff(*expected))
+        .max()
+        .unwrap_or(0)
 }
 
-impl Planes420 {
+fn full_rect() -> ExclusiveRectangle {
+    ExclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: WIDTH,
+        bottom: HEIGHT,
+    }
+}
+
+fn region(left: u16, right: u16) -> Avc420Region {
+    rect_region(left, 0, right, HEIGHT)
+}
+
+fn rect_region(left: u16, top: u16, right: u16, bottom: u16) -> Avc420Region {
+    Avc420Region {
+        left,
+        top,
+        right,
+        bottom,
+        quantization_parameter: 22,
+        quality: 100,
+    }
+}
+
+fn gray(level: u8) -> Vec<u8> {
+    [level, level, level, 0xFF].repeat(usize::from(WIDTH) * usize::from(HEIGHT))
+}
+
+// ============================================================================
+// Server to client
+// ============================================================================
+
+/// A server and a client that negotiated capabilities and share one mapped surface.
+struct Session {
+    server: GraphicsPipelineServer,
+    client: GraphicsPipelineClient,
+    surface_id: u16,
+    /// What the client has painted, tightly packed RGBA.
+    canvas: Vec<u8>,
+}
+
+impl Session {
     fn new() -> Self {
-        Self {
-            y: vec![0; W * H],
-            u: vec![0; W / 2 * H / 2],
-            v: vec![0; W / 2 * H / 2],
+        struct ServerSink;
+        impl ironrdp_egfx::server::GraphicsPipelineHandler for ServerSink {
+            fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+            fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
         }
-    }
+        struct ClientSink;
+        impl ironrdp_egfx::client::GraphicsPipelineHandler for ClientSink {}
 
-    fn view(&self) -> Yuv420Planes<'_> {
-        Yuv420Planes {
-            width: u32::try_from(W).expect("fits"),
-            y: &self.y,
-            y_stride: W,
-            u: &self.u,
-            u_stride: W / 2,
-            v: &self.v,
-            v_stride: W / 2,
-        }
-    }
-}
-
-/// Split a YUV444 frame into main and auxiliary YUV420p views in YUV444v2
-/// layout. A port of FreeRDP's encoder, `general_RGBToAVC444YUVv2_ANY_DOUBLE_ROW`
-/// (libfreerdp/primitives/prim_YUV.c), working from YUV planes instead of RGB.
-#[expect(clippy::similar_names, reason = "Y, U and V plane names")]
-fn split_v2(y444: &[u8], u444: &[u8], v444: &[u8]) -> (Planes420, Planes420) {
-    let (mut main, mut aux) = (Planes420::new(), Planes420::new());
-    let (half, quarter) = (W / 2, W / 4);
-    for row in (0..H).step_by(2) {
-        for col in (0..W).step_by(2) {
-            let (a, b, c, d) = (
-                row * W + col,
-                row * W + col + 1,
-                (row + 1) * W + col,
-                (row + 1) * W + col + 1,
-            );
-
-            // B1: luma.
-            for i in [a, b, c, d] {
-                main.y[i] = y444[i];
+        let mut server = GraphicsPipelineServer::new(Box::new(ServerSink));
+        let mut client = GraphicsPipelineClient::new(Box::new(ClientSink), Some(Box::new(PlaneDecoder)));
+        for advertise in client.start(0).expect("client start") {
+            for confirm in server
+                .process(0, &bytes(&advertise))
+                .expect("server takes the advertisement")
+            {
+                client
+                    .process(0, &bytes(&confirm))
+                    .expect("client takes the confirmation");
             }
-
-            // B2, B3: 2x2 average of U and V.
-            let average = |p: &[u8]| {
-                u8::try_from((u32::from(p[a]) + u32::from(p[b]) + u32::from(p[c]) + u32::from(p[d])) / 4)
-                    .expect("average of u8 fits")
-            };
-            main.u[row / 2 * half + col / 2] = average(u444);
-            main.v[row / 2 * half + col / 2] = average(v444);
-
-            // B4, B5: odd columns, both rows; U in the left half, V in the right.
-            aux.y[row * W + col / 2] = u444[b];
-            aux.y[row * W + half + col / 2] = v444[b];
-            aux.y[(row + 1) * W + col / 2] = u444[d];
-            aux.y[(row + 1) * W + half + col / 2] = v444[d];
-
-            // B6-B9: even columns of the odd row; columns 4x go to the
-            // auxiliary U plane, 4x+2 to the auxiliary V plane.
-            let target = if col % 4 == 0 { &mut aux.u } else { &mut aux.v };
-            target[row / 2 * half + col / 4] = u444[c];
-            target[row / 2 * half + quarter + col / 4] = v444[c];
         }
+        let mut session = Self {
+            server,
+            client,
+            surface_id: 0,
+            canvas: vec![0; usize::from(WIDTH) * usize::from(HEIGHT) * 4],
+        };
+        session.flush();
+
+        session.server.set_output_dimensions(WIDTH, HEIGHT);
+        session.surface_id = session.server.create_surface(WIDTH, HEIGHT).expect("surface");
+        assert!(session.server.map_surface_to_output(session.surface_id, 0, 0));
+        session.flush();
+        session
     }
-    (main, aux)
-}
 
-/// Split a YUV444 frame into main and auxiliary YUV420p views in YUV444 (v1)
-/// layout. A port of FreeRDP's encoder, `general_RGBToAVC444YUV_BGRX`
-/// (libfreerdp/primitives/prim_YUV.c), working from YUV planes instead of RGB.
-#[expect(clippy::similar_names, reason = "Y, U and V plane names")]
-fn split_v1(y444: &[u8], u444: &[u8], v444: &[u8]) -> (Planes420, Planes420) {
-    let (main, _) = split_v2(y444, u444, v444);
-    let mut aux = Planes420::new();
-    let half = W / 2;
-    for row in (0..H).step_by(2) {
-        // B4, B5: the odd row, in 16-row blocks of 8 U rows then 8 V rows.
-        let i = row / 2;
-        let n = (i & !7) + i;
-        let odd = (row + 1) * W;
-        aux.y[n * W..(n + 1) * W].copy_from_slice(&u444[odd..odd + W]);
-        aux.y[(n + 8) * W..(n + 9) * W].copy_from_slice(&v444[odd..odd + W]);
-
-        // B6, B7: odd columns of the even row.
-        for col in (0..W).step_by(2) {
-            aux.u[row / 2 * half + col / 2] = u444[row * W + col + 1];
-            aux.v[row / 2 * half + col / 2] = v444[row * W + col + 1];
+    /// Delivers the server's queued PDUs to the client and paints the client's output.
+    fn flush(&mut self) {
+        for message in self.server.drain_output() {
+            let responses = self.client.process(0, &bytes(&message)).expect("client takes the PDU");
+            for response in responses {
+                self.server
+                    .process(0, &bytes(&response))
+                    .expect("server takes the response");
+            }
         }
-    }
-    (main, aux)
-}
-
-type Split = fn(&[u8], &[u8], &[u8]) -> (Planes420, Planes420);
-type ApplyAuxiliary = fn(&mut Yuv444Frame, &Yuv420Planes<'_>, &[ExclusiveRectangle]) -> DecoderResult<()>;
-
-/// Both layouts: how to split a frame, and how to apply its auxiliary view.
-const LAYOUTS: [(&str, Split, ApplyAuxiliary); 2] = [
-    ("v1", split_v1, Yuv444Frame::apply_auxiliary_view_v1),
-    ("v2", split_v2, Yuv444Frame::apply_auxiliary_view_v2),
-];
-
-fn full_frame() -> [ExclusiveRectangle; 1] {
-    [ExclusiveRectangle {
-        left: 0,
-        top: 0,
-        right: u16::try_from(W).expect("fits"),
-        bottom: u16::try_from(H).expect("fits"),
-    }]
-}
-
-#[test]
-fn main_then_auxiliary_view_reconstructs_yuv444() {
-    let (y, u, v) = source_frame();
-    for (layout, split, apply_auxiliary) in LAYOUTS {
-        let (main, aux) = split(&y, &u, &v);
-
-        let mut frame = Yuv444Frame::new(W, H).expect("frame");
-        frame.apply_main_view(&main.view(), &full_frame()).expect("main view");
-        apply_auxiliary(&mut frame, &aux.view(), &full_frame()).expect("auxiliary view");
-
-        assert_eq!(frame.y(), y.as_slice(), "{layout}: luma");
-        for row in 0..H {
-            for col in 0..W {
-                let i = row * W + col;
-                if row % 2 == 0 && col % 2 == 0 {
-                    // Only the main view's 2x2 average exists for these positions.
-                    let block = |p: &[u8]| {
-                        (u32::from(p[i]) + u32::from(p[i + 1]) + u32::from(p[i + W]) + u32::from(p[i + W + 1])) / 4
-                    };
-                    assert_eq!(
-                        u32::from(frame.u()[i]),
-                        block(&u),
-                        "{layout}: U average at ({col},{row})"
-                    );
-                    assert_eq!(
-                        u32::from(frame.v()[i]),
-                        block(&v),
-                        "{layout}: V average at ({col},{row})"
-                    );
-                } else {
-                    assert_eq!(frame.u()[i], u[i], "{layout}: U at ({col},{row})");
-                    assert_eq!(frame.v()[i], v[i], "{layout}: V at ({col},{row})");
-                }
+        let row_bytes = usize::from(WIDTH) * 4;
+        for update in self.client.drain_output() {
+            let width = usize::from(update.region.right - update.region.left) * 4;
+            for (row, pixels) in update.data.chunks_exact(width).enumerate() {
+                let start = (usize::from(update.region.top) + row) * row_bytes + usize::from(update.region.left) * 4;
+                self.canvas[start..start + width].copy_from_slice(pixels);
             }
         }
     }
-}
 
-#[test]
-fn main_view_alone_upsamples_chroma() {
-    // A luma-only update shows at YUV420 quality: each 2x2 block takes the
-    // main view's chroma sample.
-    let (y, u, v) = source_frame();
-    let (main, _) = split_v2(&y, &u, &v);
-
-    let mut frame = Yuv444Frame::new(W, H).expect("frame");
-    frame.apply_main_view(&main.view(), &full_frame()).expect("main view");
-
-    for row in 0..H {
-        for col in 0..W {
-            let (i, j) = (row * W + col, row / 2 * (W / 2) + col / 2);
-            assert_eq!(frame.u()[i], main.u[j]);
-            assert_eq!(frame.v()[i], main.v[j]);
-        }
-    }
-}
-
-#[test]
-fn region_past_the_right_edge_changes_nothing() {
-    // The region clamps to an empty one at the frame's right edge, which
-    // isn't a multiple of 4 here.
-    let (y, u, v) = source_frame();
-    let (main, aux) = split_v2(&y, &u, &v);
-    let mut frame = Yuv444Frame::new(W - 7, H).expect("frame");
-    let before = frame.clone();
-
-    let past = [ExclusiveRectangle {
-        left: u16::try_from(W).expect("fits"),
-        top: 0,
-        right: u16::try_from(W + 16).expect("fits"),
-        bottom: u16::try_from(H).expect("fits"),
-    }];
-    frame.apply_main_view(&main.view(), &past).expect("main view");
-    frame
-        .apply_auxiliary_view_v2(&aux.view(), &past)
-        .expect("auxiliary view");
-
-    assert_eq!(frame.y(), before.y());
-    assert_eq!(frame.u(), before.u());
-    assert_eq!(frame.v(), before.v());
-}
-
-#[test]
-fn region_below_the_bottom_edge_changes_nothing() {
-    // The region clamps to an empty one at the frame's bottom edge, which is
-    // odd here.
-    let (y, u, v) = source_frame();
-    for (layout, split, apply_auxiliary) in LAYOUTS {
-        let (main, aux) = split(&y, &u, &v);
-        let mut frame = Yuv444Frame::new(W, H - 1).expect("frame");
-        let before = frame.clone();
-
-        let below = [ExclusiveRectangle {
-            left: 0,
-            top: u16::try_from(H).expect("fits"),
-            right: u16::try_from(W).expect("fits"),
-            bottom: u16::try_from(H + 16).expect("fits"),
-        }];
-        frame.apply_main_view(&main.view(), &below).expect("main view");
-        apply_auxiliary(&mut frame, &aux.view(), &below).expect("auxiliary view");
-
-        assert_eq!(frame.y(), before.y(), "{layout}: Y");
-        assert_eq!(frame.u(), before.u(), "{layout}: U");
-        assert_eq!(frame.v(), before.v(), "{layout}: V");
-    }
-}
-
-#[test]
-fn updates_stay_inside_their_regions() {
-    let (y, u, v) = source_frame();
-    let (main, aux) = split_v2(&y, &u, &v);
-    let mut frame = Yuv444Frame::new(W, H).expect("frame");
-    frame.apply_main_view(&main.view(), &full_frame()).expect("main view");
-    frame
-        .apply_auxiliary_view_v2(&aux.view(), &full_frame())
-        .expect("auxiliary view");
-    let before = frame.clone();
-
-    // A luma-only update to the top-left macroblock, from an all-black frame.
-    let black = Planes420 {
-        y: vec![0; W * H],
-        u: vec![128; W / 2 * H / 2],
-        v: vec![128; W / 2 * H / 2],
-    };
-    let region = [ExclusiveRectangle {
-        left: 0,
-        top: 0,
-        right: 16,
-        bottom: 16,
-    }];
-    frame.apply_main_view(&black.view(), &region).expect("main view");
-
-    for row in 0..H {
-        for col in 0..W {
-            let i = row * W + col;
-            if row < 16 && col < 16 {
-                assert_eq!((frame.y()[i], frame.u()[i], frame.v()[i]), (0, 128, 128));
-            } else {
-                assert_eq!(
-                    (frame.y()[i], frame.u()[i], frame.v()[i]),
-                    (before.y()[i], before.u()[i], before.v()[i]),
-                    "outside the region at ({col},{row})"
+    fn send(
+        &mut self,
+        layout: Avc444Layout,
+        encoding: Encoding,
+        stream1: (&Yuv420Frame, &[Avc420Region]),
+        stream2: Option<(&Yuv420Frame, &[Avc420Region])>,
+    ) {
+        let data1 = pack(stream1.0);
+        let data2 = stream2.map(|(view, _)| pack(view));
+        let regions2 = stream2.map(|(_, regions)| regions);
+        let sent = match layout {
+            Avc444Layout::V1 => {
+                assert_ne!(
+                    encoding,
+                    Encoding::CHROMA,
+                    "the server sends AVC444 chroma only with luma"
                 );
+                self.server
+                    .try_send_avc444_frame(self.surface_id, &data1, stream1.1, data2.as_deref(), regions2, 0)
+            }
+            Avc444Layout::V2 => self.server.try_send_avc444v2_frame(
+                self.surface_id,
+                encoding,
+                &data1,
+                stream1.1,
+                data2.as_deref(),
+                regions2,
+                0,
+            ),
+        };
+        sent.expect("the server queues the frame");
+        self.flush();
+    }
+}
+
+fn bytes(message: &DvcMessage) -> Vec<u8> {
+    encode_vec(message.as_ref()).expect("encode DVC message")
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+// oracle: spec MS-RDPEGFX §3.3.8.3.2
+#[rstest]
+#[case::avc444(Avc444Layout::V1)]
+#[case::avc444v2(Avc444Layout::V2)]
+fn views_recombine_into_the_original_picture(#[case] layout: Avc444Layout) {
+    let original = checkerboard(0);
+    let picture = Yuv444Frame::from_rgba(&original, WIDTH, HEIGHT).expect("picture");
+    let (main, auxiliary) = picture.split(layout).expect("views");
+
+    let mut combined = Yuv444Frame::new(WIDTH, HEIGHT);
+    combined.apply_main_view(&main, &[full_rect()]);
+    let subsampled = combined.to_rgba(&full_rect());
+    combined.apply_auxiliary_view(layout, &auxiliary, &[full_rect()]);
+    let recombined = combined.to_rgba(&full_rect());
+
+    let difference = max_difference(&recombined, &original);
+    assert!(difference <= TOLERANCE, "difference {difference}");
+    // The main view alone is the 4:2:0 picture, which loses the checkerboard's chroma.
+    assert!(max_difference(&subsampled, &original) > 50);
+}
+
+/// Forward transform of MS-RDPEGFX 3.3.8.3.1, written from the specification's matrix.
+fn spec_yuv(pixel: &[u8]) -> [u8; 3] {
+    let [r, g, b] = [pixel[0], pixel[1], pixel[2]].map(i32::from);
+    let clamp = |value: i32| u8::try_from(value.clamp(0, 255)).expect("clamped to a byte");
+    [
+        clamp((54 * r + 183 * g + 18 * b) >> 8),
+        clamp(((-29 * r - 99 * g + 128 * b) >> 8) + 128),
+        clamp(((128 * r - 116 * g - 12 * b) >> 8) + 128),
+    ]
+}
+
+/// Each auxiliary view sample is the 4:4:4 sample the specification's B4 to B9 formulas place
+/// there. The picture is three macroblocks wide, so the AVC444v2 halves start at an odd macroblock.
+// oracle: spec MS-RDPEGFX §3.3.8.3.2
+// oracle: spec MS-RDPEGFX §3.3.8.3.3
+#[rstest]
+#[case::avc444(Avc444Layout::V1)]
+#[case::avc444v2(Avc444Layout::V2)]
+fn auxiliary_views_follow_the_specification_layout(#[case] layout: Avc444Layout) {
+    const W: usize = 48;
+    const H: usize = 32;
+    let mut rgba = Vec::with_capacity(W * H * 4);
+    for i in 0..W * H {
+        // Distinct, irregular colors, so a misplaced sample shows.
+        let seed = u32::try_from(i).expect("index fits in u32").wrapping_mul(2_654_435_761);
+        let [r, g, b, _] = seed.to_le_bytes();
+        rgba.extend_from_slice(&[r, g, b, 0xFF]);
+    }
+    let yuv = |x: usize, y: usize| spec_yuv(&rgba[(y * W + x) * 4..]);
+    let (u444, v444) = (|x, y| yuv(x, y)[1], |x, y| yuv(x, y)[2]);
+
+    let picture = Yuv444Frame::from_rgba(&rgba, 48, 32).expect("picture");
+    let (main, aux) = picture.split(layout).expect("views");
+    for y in 0..H {
+        let luma = main.luma_row(y).expect("main luma row");
+        assert!((0..W).all(|x| luma[x] == yuv(x, y)[0]), "B1 row {y}");
+    }
+
+    let luma = |row| aux.luma_row(row).expect("auxiliary luma row");
+    let (u, v) = (
+        |row| aux.u_row(row).expect("auxiliary U row"),
+        |row| aux.v_row(row).expect("auxiliary V row"),
+    );
+    match layout {
+        Avc444Layout::V1 => {
+            for macroblock in (0..H).step_by(16) {
+                for y in 0..8 {
+                    for x in 0..W {
+                        assert_eq!(luma(macroblock + y)[x], u444(x, macroblock + 2 * y + 1), "B4");
+                        assert_eq!(luma(macroblock + 8 + y)[x], v444(x, macroblock + 2 * y + 1), "B5");
+                    }
+                }
+            }
+            for y in 0..H / 2 {
+                for x in 0..W / 2 {
+                    assert_eq!(u(y)[x], u444(2 * x + 1, 2 * y), "B6");
+                    assert_eq!(v(y)[x], v444(2 * x + 1, 2 * y), "B7");
+                }
             }
         }
-    }
-}
-
-#[test]
-fn regions_expand_to_whole_macroblocks() {
-    // A region covering part of a macroblock updates the whole macroblock.
-    let white = Planes420 {
-        y: vec![255; W * H],
-        u: vec![128; W / 2 * H / 2],
-        v: vec![128; W / 2 * H / 2],
-    };
-    let mut frame = Yuv444Frame::new(W, H).expect("frame");
-    let region = [ExclusiveRectangle {
-        left: 20,
-        top: 3,
-        right: 21,
-        bottom: 4,
-    }];
-    frame.apply_main_view(&white.view(), &region).expect("main view");
-    for row in 0..H {
-        for col in 0..W {
-            let inside = (16..32).contains(&col) && row < 16;
-            assert_eq!(frame.y()[row * W + col] == 255, inside, "({col},{row})");
-        }
-    }
-}
-
-#[test]
-fn rejects_views_smaller_than_the_frame() {
-    let mut frame = Yuv444Frame::new(W, H).expect("frame");
-    let short = Planes420 {
-        y: vec![0; W * H - 1],
-        u: vec![0; W / 2 * H / 2],
-        v: vec![0; W / 2 * H / 2],
-    };
-    assert!(frame.apply_main_view(&short.view(), &full_frame()).is_err());
-    for (layout, _, apply_auxiliary) in LAYOUTS {
-        assert!(
-            apply_auxiliary(&mut frame, &short.view(), &full_frame()).is_err(),
-            "{layout}"
-        );
-    }
-}
-
-#[test]
-fn converts_full_range_bt709() {
-    // MS-RDPEGFX's AVC is full-range BT.709: R = Y + 1.5748 (V - 128),
-    // G = Y - 0.1873 (U - 128) - 0.4681 (V - 128), B = Y + 1.8556 (U - 128).
-    // (Y, U, V) = (100, 180, 150) is (134.6, 79.9, 196.5).
-    let planes = Planes420 {
-        y: vec![100; W * H],
-        u: vec![180; W / 2 * H / 2],
-        v: vec![150; W / 2 * H / 2],
-    };
-    let mut frame = Yuv444Frame::new(W, H).expect("frame");
-    frame.apply_main_view(&planes.view(), &full_frame()).expect("main view");
-    let rgba = frame
-        .to_rgba(&ExclusiveRectangle {
-            left: 0,
-            top: 0,
-            right: 1,
-            bottom: 1,
-        })
-        .expect("rgba");
-    for (got, want) in rgba.iter().zip([135u8, 80, 197, 255]) {
-        assert!(
-            got.abs_diff(want) <= 1,
-            "RGBA {rgba:?}, expected about [135, 80, 197, 255]"
-        );
-    }
-}
-
-#[test]
-fn rejects_empty_frames() {
-    assert!(Yuv444Frame::new(W, 0).is_err());
-    assert!(Yuv444Frame::new(0, H).is_err());
-}
-
-#[test]
-fn cropped_frame_reads_auxiliary_view_at_coded_width() {
-    // The views are encoded W wide and the decoder crops them. The auxiliary
-    // view's V half still starts at W / 2, not at half the cropped width.
-    let (y, u, v) = source_frame();
-    let (main, aux) = split_v2(&y, &u, &v);
-
-    for (width, height) in [(W - 6, H), (W - 7, H - 1), (W - 5, H)] {
-        let region = [ExclusiveRectangle {
-            left: 0,
-            top: 0,
-            right: u16::try_from(width).expect("fits"),
-            bottom: u16::try_from(height).expect("fits"),
-        }];
-        let mut frame = Yuv444Frame::new(width, height).expect("frame");
-        frame.apply_main_view(&main.view(), &region).expect("main view");
-        for row in 0..height {
-            for col in 0..width {
-                let (i, j) = (row * width + col, row / 2 * (W / 2) + col / 2);
-                assert_eq!(frame.u()[i], main.u[j], "{width}x{height}: main U at ({col},{row})");
-                assert_eq!(frame.v()[i], main.v[j], "{width}x{height}: main V at ({col},{row})");
+        Avc444Layout::V2 => {
+            for y in 0..H {
+                for x in 0..W / 2 {
+                    assert_eq!(luma(y)[x], u444(2 * x + 1, y), "B4");
+                    assert_eq!(luma(y)[W / 2 + x], v444(2 * x + 1, y), "B5");
+                }
             }
-        }
-        frame
-            .apply_auxiliary_view_v2(
-                &Yuv420Planes {
-                    width: u32::try_from(width).expect("fits"),
-                    ..aux.view()
-                },
-                &region,
-            )
-            .expect("auxiliary view");
-
-        for row in 0..height {
-            for col in 0..width {
-                let (i, src) = (row * width + col, row * W + col);
-                assert_eq!(frame.y()[i], y[src], "{width}x{height}: Y at ({col},{row})");
-                if row % 2 == 1 || col % 2 == 1 {
-                    assert_eq!(frame.u()[i], u[src], "{width}x{height}: U at ({col},{row})");
-                    assert_eq!(frame.v()[i], v[src], "{width}x{height}: V at ({col},{row})");
+            for y in 0..H / 2 {
+                for x in 0..W / 4 {
+                    assert_eq!(u(y)[x], u444(4 * x, 2 * y + 1), "B6");
+                    assert_eq!(u(y)[W / 4 + x], v444(4 * x, 2 * y + 1), "B7");
+                    assert_eq!(v(y)[x], u444(4 * x + 2, 2 * y + 1), "B8");
+                    assert_eq!(v(y)[W / 4 + x], v444(4 * x + 2, 2 * y + 1), "B9");
                 }
             }
         }
     }
 }
 
-#[test]
-fn cropped_frame_reads_v1_rows_past_the_cropped_height() {
-    // Encoded W x H and cropped. The last block's V rows are stored past the
-    // cropped height: read while the planes hold them, and otherwise left at
-    // the main view's chroma.
-    let (y, u, v) = source_frame();
-    let (main, aux) = split_v1(&y, &u, &v);
-    // At a height 1 to 8 past a multiple of 16, the last block's V rows are
-    // past it.
-    let (width, height) = (W - 7, H - 8);
-    let region = [ExclusiveRectangle {
-        left: 0,
-        top: 0,
-        right: u16::try_from(width).expect("fits"),
-        bottom: u16::try_from(height).expect("fits"),
-    }];
-    let to_height = Planes420 {
-        y: aux.y[..W * height].to_vec(),
-        u: aux.u.clone(),
-        v: aux.v.clone(),
+/// Views packed straight from the specification's B1 to B9 formulas, with each 2x2 chroma
+/// average in the main view, recombine into the original picture.
+// oracle: spec MS-RDPEGFX §3.3.8.3.2
+// oracle: spec MS-RDPEGFX §3.3.8.3.3
+#[rstest]
+#[case::avc444(Avc444Layout::V1)]
+#[case::avc444v2(Avc444Layout::V2)]
+fn views_packed_from_the_specification_recombine(#[case] layout: Avc444Layout) {
+    const W: usize = 48;
+    const H: usize = 32;
+    let original = checkerboard_of(0, W, H);
+    let yuv: Vec<[u8; 3]> = original.chunks_exact(4).map(spec_yuv).collect();
+    let at = |x: usize, y: usize| yuv[y * W + x];
+    let (u444, v444) = (|x, y| at(x, y)[1], |x, y| at(x, y)[2]);
+    let average = |plane: usize, x: usize, y: usize| {
+        let sum: u32 = [(0, 0), (1, 0), (0, 1), (1, 1)]
+            .iter()
+            .map(|(dx, dy)| u32::from(at(2 * x + dx, 2 * y + dy)[plane]))
+            .sum();
+        u8::try_from((sum + 2) / 4).expect("average of bytes")
     };
 
-    for (planes, full) in [(&aux, true), (&to_height, false)] {
-        let mut frame = Yuv444Frame::new(width, height).expect("frame");
-        frame.apply_main_view(&main.view(), &region).expect("main view");
-        frame
-            .apply_auxiliary_view_v1(&planes.view(), &region)
-            .expect("auxiliary view");
+    let (half_w, half_h) = (W / 2, H / 2);
+    let main_y: Vec<u8> = (0..H)
+        .flat_map(|y| (0..W).map(move |x| (x, y)))
+        .map(|(x, y)| at(x, y)[0])
+        .collect();
+    let main_u: Vec<u8> = (0..half_h)
+        .flat_map(|y| (0..half_w).map(move |x| (x, y)))
+        .map(|(x, y)| average(1, x, y))
+        .collect();
+    let main_v: Vec<u8> = (0..half_h)
+        .flat_map(|y| (0..half_w).map(move |x| (x, y)))
+        .map(|(x, y)| average(2, x, y))
+        .collect();
 
-        for row in (1..height).step_by(2) {
-            let i = row / 2;
-            let v_row = (i & !7) + i + 8;
-            for col in 0..width {
-                let (dst, src) = (row * width + col, row * W + col);
-                assert_eq!(frame.u()[dst], u[src], "full {full}: U at ({col},{row})");
-                let want = if full || v_row < height {
-                    v[src]
-                } else {
-                    main.v[row / 2 * (W / 2) + col / 2]
-                };
-                assert_eq!(frame.v()[dst], want, "full {full}: V at ({col},{row})");
+    let (mut aux_y, mut aux_u, mut aux_v) = (vec![0; W * H], vec![0; half_w * half_h], vec![0; half_w * half_h]);
+    match layout {
+        Avc444Layout::V1 => {
+            for macroblock in (0..H).step_by(16) {
+                for y in 0..8 {
+                    for x in 0..W {
+                        aux_y[(macroblock + y) * W + x] = u444(x, macroblock + 2 * y + 1);
+                        aux_y[(macroblock + 8 + y) * W + x] = v444(x, macroblock + 2 * y + 1);
+                    }
+                }
+            }
+            for y in 0..half_h {
+                for x in 0..half_w {
+                    aux_u[y * half_w + x] = u444(2 * x + 1, 2 * y);
+                    aux_v[y * half_w + x] = v444(2 * x + 1, 2 * y);
+                }
             }
         }
-    }
-}
-
-#[test]
-fn frame_narrower_than_the_views_reads_auxiliary_view_at_their_width() {
-    // A frame clipped to a surface narrower than the picture: the auxiliary
-    // view's V half still starts at half the picture's width.
-    let (y, u, v) = source_frame();
-    let (main, aux) = split_v2(&y, &u, &v);
-    let width = 16;
-    let region = [ExclusiveRectangle {
-        left: 0,
-        top: 0,
-        right: u16::try_from(width).expect("fits"),
-        bottom: u16::try_from(H).expect("fits"),
-    }];
-    let mut frame = Yuv444Frame::new(width, H).expect("frame");
-    frame.apply_main_view(&main.view(), &region).expect("main view");
-    frame
-        .apply_auxiliary_view_v2(&aux.view(), &region)
-        .expect("auxiliary view");
-
-    for row in 0..H {
-        for col in 0..width {
-            let (i, src) = (row * width + col, row * W + col);
-            assert_eq!(frame.y()[i], y[src], "Y at ({col},{row})");
-            if row % 2 == 1 || col % 2 == 1 {
-                assert_eq!(frame.u()[i], u[src], "U at ({col},{row})");
-                assert_eq!(frame.v()[i], v[src], "V at ({col},{row})");
+        Avc444Layout::V2 => {
+            for y in 0..H {
+                for x in 0..half_w {
+                    aux_y[y * W + x] = u444(2 * x + 1, y);
+                    aux_y[y * W + half_w + x] = v444(2 * x + 1, y);
+                }
             }
-        }
-    }
-}
-
-#[test]
-fn frame_smaller_than_the_views_reads_v1_auxiliary_view_at_their_layout() {
-    // A frame clipped to a surface narrower or shorter than the picture: the
-    // auxiliary view's bands are of the picture, so the last band's V rows
-    // lie past the frame's height but inside the view.
-    let (y, u, v) = source_frame();
-    let (main, aux) = split_v1(&y, &u, &v);
-    // 40 is 8 past a multiple of 16: the last band's V rows are at 40-43.
-    for (width, height) in [(16, H), (W, H - 8), (16, H - 8)] {
-        let region = [ExclusiveRectangle {
-            left: 0,
-            top: 0,
-            right: u16::try_from(width).expect("fits"),
-            bottom: u16::try_from(height).expect("fits"),
-        }];
-        let mut frame = Yuv444Frame::new(width, height).expect("frame");
-        frame.apply_main_view(&main.view(), &region).expect("main view");
-        frame
-            .apply_auxiliary_view_v1(&aux.view(), &region)
-            .expect("auxiliary view");
-
-        for row in 0..height {
-            for col in 0..width {
-                let (i, src) = (row * width + col, row * W + col);
-                assert_eq!(frame.y()[i], y[src], "{width}x{height}: Y at ({col},{row})");
-                if row % 2 == 1 || col % 2 == 1 {
-                    assert_eq!(frame.u()[i], u[src], "{width}x{height}: U at ({col},{row})");
-                    assert_eq!(frame.v()[i], v[src], "{width}x{height}: V at ({col},{row})");
+            for y in 0..half_h {
+                for x in 0..W / 4 {
+                    aux_u[y * half_w + x] = u444(4 * x, 2 * y + 1);
+                    aux_u[y * half_w + W / 4 + x] = v444(4 * x, 2 * y + 1);
+                    aux_v[y * half_w + x] = u444(4 * x + 2, 2 * y + 1);
+                    aux_v[y * half_w + W / 4 + x] = v444(4 * x + 2, 2 * y + 1);
                 }
             }
         }
     }
+
+    let (w16, h16) = (u16::try_from(W).expect("width"), u16::try_from(H).expect("height"));
+    let main = Yuv420Frame::new(w16, h16, main_y, W, main_u, main_v, half_w).expect("main view");
+    let aux = Yuv420Frame::new(w16, h16, aux_y, W, aux_u, aux_v, half_w).expect("auxiliary view");
+    let everything = ExclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: w16,
+        bottom: h16,
+    };
+    let mut combined = Yuv444Frame::new(w16, h16);
+    combined.apply_main_view(&main, core::slice::from_ref(&everything));
+    combined.apply_auxiliary_view(layout, &aux, core::slice::from_ref(&everything));
+
+    let difference = max_difference(&combined.to_rgba(&everything), &original);
+    assert!(difference <= TOLERANCE, "difference {difference}");
 }
 
-/// Through `GraphicsPipelineClient` with OpenH264: the two views are encoded
-/// as one H.264 stream by a single encoder, as MS-RDPEGFX 2.2.4.5 requires,
-/// sent as one AVC444v2 PDU, and decoded and combined by the client.
-#[cfg(feature = "openh264-bundled")]
-mod end_to_end {
-    use std::sync::{Arc, Mutex};
+/// The bytes a picture is charged for match the bytes it holds, across macroblock edges.
+// oracle: mutant allocation_size and allocated_bytes disagreeing, leaking or over-crediting the budget
+#[test]
+fn a_picture_holds_exactly_its_allocation_size() {
+    let sizes = (0..=33).flat_map(|w| (0..=33).map(move |h| (w, h)));
+    for (width, height) in sizes.chain([(u16::MAX, 1), (1, u16::MAX)]) {
+        assert_eq!(
+            Yuv444Frame::new(width, height).allocated_bytes(),
+            Yuv444Frame::allocation_size(width, height),
+            "{width}x{height}"
+        );
+    }
+}
 
-    use ironrdp_core::encode_vec;
-    use ironrdp_dvc::DvcProcessor as _;
-    use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler};
-    use ironrdp_egfx::decode::OpenH264Decoder;
+// oracle: property round-trip
+#[test]
+fn a_converted_picture_reads_back_unchanged() {
+    let original = checkerboard(0);
+    let picture = Yuv444Frame::from_rgba(&original, WIDTH, HEIGHT).expect("picture");
+    let difference = max_difference(&picture.to_rgba(&full_rect()), &original);
+    assert!(difference <= TOLERANCE, "difference {difference}");
+}
+
+// oracle: spec MS-RDPEGFX §3.3.8.3.2
+#[rstest]
+#[case::avc444(Avc444Layout::V1)]
+#[case::avc444v2(Avc444Layout::V2)]
+fn a_main_view_keeps_luma_outside_its_rectangles(#[case] layout: Avc444Layout) {
+    let mut session = Session::new();
+    let (main, auxiliary) = Yuv444Frame::from_rgba(&gray(100), WIDTH, HEIGHT)
+        .expect("picture")
+        .split(layout)
+        .expect("views");
+    let everything = [region(0, WIDTH)];
+    session.send(
+        layout,
+        Encoding::LUMA_AND_CHROMA,
+        (&main, &everything),
+        Some((&auxiliary, &everything)),
+    );
+
+    // The main rectangle and the auxiliary rectangle split the first 2x2 block.
+    let (main, auxiliary) = Yuv444Frame::from_rgba(&gray(200), WIDTH, HEIGHT)
+        .expect("picture")
+        .split(layout)
+        .expect("views");
+    session.send(
+        layout,
+        Encoding::LUMA_AND_CHROMA,
+        (&main, &[rect_region(1, 0, 2, 1)]),
+        Some((&auxiliary, &[rect_region(0, 0, 1, 1)])),
+    );
+
+    let pixel = |x: usize| &session.canvas[x * 4..x * 4 + 3];
+    assert!(max_difference(pixel(0), &[100; 3]) <= TOLERANCE, "{:?}", pixel(0));
+    assert!(max_difference(pixel(1), &[200; 3]) <= TOLERANCE, "{:?}", pixel(1));
+}
+
+// oracle: mutant the AVC444 picture allocated outside the compositor budget
+#[test]
+fn avc444_on_a_surface_the_compositor_refused_is_dropped() {
     use ironrdp_egfx::pdu::{
-        Avc420BitmapStream, Avc444BitmapStream, CapabilitiesConfirmPdu, CapabilitiesV107Flags, CapabilitySet,
-        Codec1Type, CreateSurfacePdu, Encoding, GfxPdu, PixelFormat, QuantQuality, WireToSurface1Pdu,
+        Avc420BitmapStream, Avc444BitmapStream, CapabilitiesConfirmPdu, CapabilitiesV107Flags, Codec1Type,
+        CreateSurfacePdu, GfxPdu, PixelFormat, QuantQuality, WireToSurface1Pdu,
     };
     use ironrdp_graphics::zgfx::wrap_uncompressed;
 
-    use super::*;
+    struct ClientSink;
+    impl ironrdp_egfx::client::GraphicsPipelineHandler for ClientSink {}
+    let send = |client: &mut GraphicsPipelineClient, pdu: &GfxPdu| {
+        let encoded = encode_vec(pdu).expect("encode PDU");
+        client.process(0, &wrap_uncompressed(&encoded))
+    };
 
-    /// Collects the destination and RGBA of every bitmap update.
-    struct Capture(Arc<Mutex<Vec<(ExclusiveRectangle, Vec<u8>)>>>);
+    let mut client = GraphicsPipelineClient::new(Box::new(ClientSink), Some(Box::new(PlaneDecoder)));
+    let confirm = CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V10_7 {
+        flags: CapabilitiesV107Flags::empty(),
+    });
+    send(&mut client, &GfxPdu::CapabilitiesConfirm(confirm)).expect("confirm");
+    // A 1 GiB canvas exceeds the compositor budget, so the surface has no pixels.
+    let create = CreateSurfacePdu {
+        surface_id: 1,
+        width: 16384,
+        height: 16384,
+        pixel_format: PixelFormat::XRgb,
+    };
+    send(&mut client, &GfxPdu::CreateSurface(create)).expect("create surface");
 
-    impl GraphicsPipelineHandler for Capture {
-        fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
-            assert!(matches!(update.codec_id, Codec1Type::Avc444v2 | Codec1Type::Avc444));
-            self.0
-                .lock()
-                .expect("lock")
-                .push((update.destination_rectangle.clone(), update.data.clone()));
-        }
-    }
+    let (main, _) = Yuv444Frame::from_rgba(&gray(100), WIDTH, HEIGHT)
+        .expect("picture")
+        .split(Avc444Layout::V1)
+        .expect("views");
+    let data = pack(&main);
+    let rect = full_rect();
+    let stream = Avc444BitmapStream {
+        encoding: Encoding::LUMA,
+        stream1: Avc420BitmapStream {
+            rectangles: vec![rect.clone()],
+            quant_qual_vals: vec![QuantQuality {
+                quantization_parameter: 22,
+                progressive: false,
+                quality: 100,
+            }],
+            data: &data,
+        },
+        stream2: None,
+    };
+    let wire = WireToSurface1Pdu {
+        surface_id: 1,
+        codec_id: Codec1Type::Avc444,
+        pixel_format: PixelFormat::XRgb,
+        destination_rectangle: rect,
+        bitmap_data: encode_vec(&stream).expect("encode AVC444 stream"),
+    };
+    send(&mut client, &GfxPdu::WireToSurface1(wire)).expect("the session survives");
+    assert_eq!(client.dropped_updates(), 1);
+}
 
-    /// A source with one-pixel chroma stripes: U alternates by column, V by
-    /// row. YUV420 averages them away; YUV444 keeps them.
-    fn striped_source() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let mut y = vec![0u8; W * H];
-        let mut u = vec![0u8; W * H];
-        let mut v = vec![0u8; W * H];
-        for row in 0..H {
-            for col in 0..W {
-                let i = row * W + col;
-                y[i] = u8::try_from(64 + (row + col) % 128).expect("fits");
-                u[i] = if col % 2 == 0 { 78 } else { 178 };
-                v[i] = if row % 2 == 0 { 78 } else { 178 };
-            }
-        }
-        (y, u, v)
-    }
+// oracle: mutant AVC444 sets dropped or not negotiated with a YUV decoder
+#[test]
+fn the_client_negotiates_avc444_with_a_yuv_decoder() {
+    let session = Session::new();
+    assert!(
+        matches!(
+            session.client.negotiated_capabilities(),
+            Some(CapabilitySet::V10_7 { .. })
+        ),
+        "negotiated {:?}",
+        session.client.negotiated_capabilities()
+    );
+    assert!(session.client.codec_capabilities().avc444);
+    assert!(session.server.supports_avc444());
+}
 
-    fn mean_abs_error(a: &[u8], b: &[u8]) -> f64 {
-        assert_eq!(a.len(), b.len());
-        let total: u64 = a.iter().zip(b).map(|(x, y)| u64::from(x.abs_diff(*y))).sum();
-        #[expect(clippy::cast_precision_loss, reason = "test statistic")]
-        let mean = total as f64 / a.len() as f64;
-        mean
-    }
+// oracle: spec MS-RDPEGFX §2.2.4.5
+#[rstest]
+#[case::avc444(Avc444Layout::V1)]
+#[case::avc444v2(Avc444Layout::V2)]
+fn luma_and_chroma_round_trip_through_the_server(#[case] layout: Avc444Layout) {
+    let mut session = Session::new();
+    let original = checkerboard(0);
+    let picture = Yuv444Frame::from_rgba(&original, WIDTH, HEIGHT).expect("picture");
+    let (main, auxiliary) = picture.split(layout).expect("views");
+    let regions = [region(0, WIDTH)];
 
-    fn avc420_stream<'a>(data: &'a [u8], regions: &[ExclusiveRectangle]) -> Avc420BitmapStream<'a> {
-        Avc420BitmapStream {
-            rectangles: regions.to_vec(),
-            quant_qual_vals: vec![
-                QuantQuality {
-                    quantization_parameter: 22,
-                    progressive: false,
-                    quality: 100,
-                };
-                regions.len()
-            ],
-            data,
-        }
-    }
+    session.send(
+        layout,
+        Encoding::LUMA_AND_CHROMA,
+        (&main, &regions),
+        Some((&auxiliary, &regions)),
+    );
 
-    fn process(client: &mut GraphicsPipelineClient, pdu: &GfxPdu) {
-        let bytes = encode_vec(pdu).expect("encode PDU");
-        client.process(0, &wrap_uncompressed(&bytes)).expect("process PDU");
-    }
+    let difference = max_difference(&session.canvas, &original);
+    assert!(difference <= TOLERANCE, "difference {difference}");
+}
 
-    /// Encode the main view then the auxiliary view with one encoder: one
-    /// H.264 stream.
-    fn encode_views(main: &Planes420, aux: &Planes420) -> (Vec<u8>, Vec<u8>) {
-        let config = openh264::encoder::EncoderConfig::new()
-            .skip_frames(false)
-            .bitrate(openh264::encoder::BitRate::from_bps(50_000_000));
-        let mut encoder =
-            openh264::encoder::Encoder::with_api_config(openh264::OpenH264API::from_source(), config).expect("encoder");
-        let mut encode = |planes: &Planes420| {
-            let yuv = openh264::formats::YUVSlices::new((&planes.y, &planes.u, &planes.v), (W, H), (W, W / 2, W / 2));
-            encoder.encode(&yuv).expect("encode").to_vec()
-        };
-        let (main_h264, aux_h264) = (encode(main), encode(aux));
-        assert!(!main_h264.is_empty() && !aux_h264.is_empty(), "encoder skipped a view");
-        (main_h264, aux_h264)
-    }
+// oracle: spec MS-RDPEGFX §2.2.4.6
+#[test]
+fn a_chroma_update_completes_an_earlier_luma_update() {
+    let layout = Avc444Layout::V2;
+    let mut session = Session::new();
+    let original = checkerboard(0);
+    let picture = Yuv444Frame::from_rgba(&original, WIDTH, HEIGHT).expect("picture");
+    let (main, auxiliary) = picture.split(layout).expect("views");
+    let regions = [region(0, WIDTH)];
 
-    /// Send one AVC444v2 PDU covering the whole surface, with both views
-    /// updating `regions`, and return the bitmap updates it produces.
-    fn decode_through_client(
-        main_h264: &[u8],
-        aux_h264: &[u8],
-        regions: &[ExclusiveRectangle],
-    ) -> Vec<(ExclusiveRectangle, Vec<u8>)> {
-        let (result, updates) = send_avc444(main_h264, aux_h264, regions);
-        result.expect("process AVC444 PDU");
-        updates
-    }
+    session.send(layout, Encoding::LUMA, (&main, &regions), None);
+    assert!(
+        max_difference(&session.canvas, &original) > 50,
+        "a luma subframe alone paints the 4:2:0 picture"
+    );
 
-    /// Send one AVC444v2 PDU as `decode_through_client` does, returning
-    /// whether the client accepted it.
-    fn send_avc444(
-        main_h264: &[u8],
-        aux_h264: &[u8],
-        regions: &[ExclusiveRectangle],
-    ) -> (ironrdp_pdu::PduResult<()>, Vec<(ExclusiveRectangle, Vec<u8>)>) {
-        send_stream(&Avc444BitmapStream {
-            encoding: Encoding::LUMA_AND_CHROMA,
-            stream1: avc420_stream(main_h264, regions),
-            stream2: Some(avc420_stream(aux_h264, regions)),
-        })
-    }
+    session.send(layout, Encoding::CHROMA, (&auxiliary, &regions), None);
+    assert!(max_difference(&session.canvas, &original) <= TOLERANCE);
+}
 
-    /// Send `stream` as one AVC444v2 PDU to a new surface.
-    fn send_stream(
-        stream: &Avc444BitmapStream<'_>,
-    ) -> (ironrdp_pdu::PduResult<()>, Vec<(ExclusiveRectangle, Vec<u8>)>) {
-        let (mut client, updates) = client_with_surface();
-        let result = send(&mut client, stream);
-        let updates = updates.lock().expect("lock").clone();
-        (result, updates)
-    }
+// oracle: spec MS-RDPEGFX §3.3.8.3.2
+#[rstest]
+#[case::avc444(Avc444Layout::V1)]
+#[case::avc444v2(Avc444Layout::V2)]
+fn an_update_only_paints_its_region_rectangles(#[case] layout: Avc444Layout) {
+    let mut session = Session::new();
+    let first = checkerboard(0);
+    let (main, auxiliary) = Yuv444Frame::from_rgba(&first, WIDTH, HEIGHT)
+        .expect("picture")
+        .split(layout)
+        .expect("views");
+    let everything = [region(0, WIDTH)];
+    session.send(
+        layout,
+        Encoding::LUMA_AND_CHROMA,
+        (&main, &everything),
+        Some((&auxiliary, &everything)),
+    );
 
-    type Updates = Arc<Mutex<Vec<(ExclusiveRectangle, Vec<u8>)>>>;
+    let second = checkerboard(1);
+    let (main, auxiliary) = Yuv444Frame::from_rgba(&second, WIDTH, HEIGHT)
+        .expect("picture")
+        .split(layout)
+        .expect("views");
+    let left = [region(0, 16)];
+    session.send(
+        layout,
+        Encoding::LUMA_AND_CHROMA,
+        (&main, &left),
+        Some((&auxiliary, &left)),
+    );
 
-    /// A client with V10.7 confirmed and surface 1 created, and the bitmap
-    /// updates it paints.
-    fn client_with_surface() -> (GraphicsPipelineClient, Updates) {
-        let updates = Arc::new(Mutex::new(Vec::new()));
-        let mut client = GraphicsPipelineClient::new(
-            Box::new(Capture(Arc::clone(&updates))),
-            Some(Box::new(OpenH264Decoder::new().expect("decoder"))),
-        );
-        process(
-            &mut client,
-            &GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V10_7 {
-                flags: CapabilitiesV107Flags::empty(),
-            })),
-        );
-        create_surface_1(&mut client);
-        (client, updates)
-    }
-
-    fn create_surface_1(client: &mut GraphicsPipelineClient) {
-        process(
-            client,
-            &GfxPdu::CreateSurface(CreateSurfacePdu {
-                surface_id: 1,
-                width: u16::try_from(W).expect("fits"),
-                height: u16::try_from(H).expect("fits"),
-                pixel_format: PixelFormat::XRgb,
-            }),
-        );
-    }
-
-    /// Send `stream` to surface 1 as one AVC444v2 PDU.
-    fn send(client: &mut GraphicsPipelineClient, stream: &Avc444BitmapStream<'_>) -> ironrdp_pdu::PduResult<()> {
-        send_as(client, Codec1Type::Avc444v2, stream)
-    }
-
-    /// Send `stream` to surface 1 as one PDU of `codec_id`.
-    fn send_as(
-        client: &mut GraphicsPipelineClient,
-        codec_id: Codec1Type,
-        stream: &Avc444BitmapStream<'_>,
-    ) -> ironrdp_pdu::PduResult<()> {
-        let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
-            surface_id: 1,
-            codec_id,
-            pixel_format: PixelFormat::XRgb,
-            destination_rectangle: full_frame()[0].clone(),
-            bitmap_data: encode_vec(stream).expect("encode AVC444 stream"),
-        });
-        let bytes = encode_vec(&pdu).expect("encode PDU");
-        client.process(0, &wrap_uncompressed(&bytes)).map(drop)
-    }
-
-    #[test]
-    fn avc444v2_through_the_client_keeps_full_chroma() {
-        let (y, u, v) = striped_source();
-        let (main, aux) = split_v2(&y, &u, &v);
-        let (main_h264, aux_h264) = encode_views(&main, &aux);
-
-        // Both views update the same region: one bitmap update.
-        let updates = decode_through_client(&main_h264, &aux_h264, &full_frame());
-        assert_eq!(updates.len(), 1, "one bitmap update");
-        let (rect, got) = &updates[0];
-        assert_eq!(rect, &full_frame()[0]);
-
-        // References without H.264 loss: the full reconstruction, and the
-        // main view alone (what AVC420 would show).
-        let mut full = Yuv444Frame::new(W, H).expect("frame");
-        full.apply_main_view(&main.view(), &full_frame()).expect("main");
-        full.apply_auxiliary_view_v2(&aux.view(), &full_frame()).expect("aux");
-        let mut luma_only = Yuv444Frame::new(W, H).expect("frame");
-        luma_only.apply_main_view(&main.view(), &full_frame()).expect("main");
-
-        let to_444 = mean_abs_error(got, &full.to_rgba(&full_frame()[0]).expect("rgba"));
-        let to_420 = mean_abs_error(got, &luma_only.to_rgba(&full_frame()[0]).expect("rgba"));
+    let row_bytes = usize::from(WIDTH) * 4;
+    for (row, (painted, (first, second))) in session
+        .canvas
+        .chunks_exact(row_bytes)
+        .zip(first.chunks_exact(row_bytes).zip(second.chunks_exact(row_bytes)))
+        .enumerate()
+    {
+        let (painted_left, painted_right) = painted.split_at(16 * 4);
         assert!(
-            to_444 * 4.0 < to_420,
-            "expected the output to match YUV444, not YUV420: error {to_444:.2} vs {to_420:.2}"
+            max_difference(painted_left, &second[..16 * 4]) <= TOLERANCE,
+            "row {row} left of the region edge shows the second picture"
+        );
+        assert!(
+            max_difference(painted_right, &first[16 * 4..]) <= TOLERANCE,
+            "row {row} right of the region edge keeps the first picture"
         );
     }
+}
 
-    #[test]
-    fn avc444v2_paints_only_the_updated_regions() {
-        // The reconstructed frame is current only inside the PDU's regions;
-        // painting the rest of the destination would overwrite the surface
-        // with stale or empty frame content.
-        let (y, u, v) = striped_source();
-        let (main, aux) = split_v2(&y, &u, &v);
-        let (main_h264, aux_h264) = encode_views(&main, &aux);
-        let regions = [
-            ExclusiveRectangle {
-                left: 16,
-                top: 16,
-                right: 32,
-                bottom: 32,
-            },
-            ExclusiveRectangle {
-                left: 40,
-                top: 8,
-                right: 60,
-                bottom: 20,
-            },
-        ];
-
-        let updates = decode_through_client(&main_h264, &aux_h264, &regions);
-        let rects: Vec<_> = updates.iter().map(|(rect, _)| rect.clone()).collect();
-        assert_eq!(rects, regions);
-
-        // Each update holds its own region's pixels, not the frame's top-left.
-        let mut full = Yuv444Frame::new(W, H).expect("frame");
-        full.apply_main_view(&main.view(), &full_frame()).expect("main");
-        full.apply_auxiliary_view_v2(&aux.view(), &full_frame()).expect("aux");
-        for (rect, data) in &updates {
-            let at_origin = ExclusiveRectangle {
-                left: 0,
-                top: 0,
-                right: rect.right - rect.left,
-                bottom: rect.bottom - rect.top,
-            };
-            let to_region = mean_abs_error(data, &full.to_rgba(rect).expect("rgba"));
-            let to_origin = mean_abs_error(data, &full.to_rgba(&at_origin).expect("rgba"));
-            assert!(
-                to_region * 4.0 < to_origin,
-                "update for {rect:?} doesn't match its region: error {to_region:.2} vs {to_origin:.2} at the origin"
-            );
+// oracle: spec MS-RDPEGFX §2.2.3.3
+#[test]
+fn a_decoder_without_yuv_planes_advertises_no_avc444() {
+    /// A decoder that only returns RGBA.
+    struct RgbaDecoder;
+    impl H264Decoder for RgbaDecoder {
+        fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
+            Ok(DecodedFrame::new(vec![0; 16 * 16 * 4], 16, 16))
         }
     }
+    struct ClientSink;
+    impl ironrdp_egfx::client::GraphicsPipelineHandler for ClientSink {}
 
-    #[test]
-    fn avc444v2_rejects_views_of_different_sizes() {
-        // Both views are one frame. An auxiliary view of another size would
-        // be read at the main view's half and quarter offsets.
-        let (y, u, v) = striped_source();
-        let (main, _) = split_v2(&y, &u, &v);
-        let (main_h264, _) = encode_views(&main, &main);
-        let wide = W + 16;
-        let (wide_y, wide_chroma) = (vec![128u8; wide * H], vec![128u8; wide / 2 * H / 2]);
-        let mut encoder = openh264::encoder::Encoder::with_api_config(
-            openh264::OpenH264API::from_source(),
-            openh264::encoder::EncoderConfig::new().skip_frames(false),
-        )
-        .expect("encoder");
-        let yuv = openh264::formats::YUVSlices::new(
-            (&wide_y, &wide_chroma, &wide_chroma),
-            (wide, H),
-            (wide, wide / 2, wide / 2),
-        );
-        let wide_h264 = encoder.encode(&yuv).expect("encode").to_vec();
-
-        let (result, updates) = send_avc444(&main_h264, &wide_h264, &full_frame());
-        assert!(
-            result.is_err(),
-            "accepted an auxiliary view {wide} wide for a {W}-wide main view"
-        );
-        assert!(updates.is_empty(), "painted a frame from mismatched views");
-    }
-
-    #[test]
-    fn avc444v2_chroma_without_its_luma_paints_nothing() {
-        // A chroma-only update refines the luma already on the surface. With
-        // no luma of its size there, painting it would show chroma over black.
-        let (y, u, v) = striped_source();
-        let (main, aux) = split_v2(&y, &u, &v);
-        // The first frame of its own stream, so it decodes on its own.
-        let (aux_h264, _) = encode_views(&aux, &main);
-
-        let (result, updates) = send_stream(&Avc444BitmapStream {
-            encoding: Encoding::CHROMA,
-            stream1: avc420_stream(&aux_h264, &full_frame()),
-            stream2: None,
-        });
-        result.expect("a chroma-only update is not an error");
-        assert!(updates.is_empty(), "painted chroma with no luma under it");
-    }
-
-    fn luma_only<'a>(main_h264: &'a [u8]) -> Avc444BitmapStream<'a> {
-        Avc444BitmapStream {
-            encoding: Encoding::LUMA,
-            stream1: avc420_stream(main_h264, &full_frame()),
-            stream2: None,
-        }
-    }
-
-    fn chroma_only<'a>(aux_h264: &'a [u8]) -> Avc444BitmapStream<'a> {
-        Avc444BitmapStream {
-            encoding: Encoding::CHROMA,
-            stream1: avc420_stream(aux_h264, &full_frame()),
-            stream2: None,
-        }
-    }
-
-    #[test]
-    fn avc444v2_luma_then_chroma_in_separate_updates_combine() {
-        // A server can send the main view alone (LC = 1) and refine it later
-        // with the auxiliary view alone (LC = 2); the second paints full chroma.
-        let (y, u, v) = striped_source();
-        let (main, aux) = split_v2(&y, &u, &v);
-        let (main_h264, aux_h264) = encode_views(&main, &aux);
-        let (mut client, updates) = client_with_surface();
-
-        send(&mut client, &luma_only(&main_h264)).expect("luma-only update");
-        send(&mut client, &chroma_only(&aux_h264)).expect("chroma-only update");
-
-        let updates = updates.lock().expect("lock").clone();
-        assert_eq!(updates.len(), 2, "one bitmap update per PDU");
-        let mut full = Yuv444Frame::new(W, H).expect("frame");
-        full.apply_main_view(&main.view(), &full_frame()).expect("main");
-        full.apply_auxiliary_view_v2(&aux.view(), &full_frame()).expect("aux");
-        let mut luma_only = Yuv444Frame::new(W, H).expect("frame");
-        luma_only.apply_main_view(&main.view(), &full_frame()).expect("main");
-        let got = &updates[1].1;
-        let to_444 = mean_abs_error(got, &full.to_rgba(&full_frame()[0]).expect("rgba"));
-        let to_420 = mean_abs_error(got, &luma_only.to_rgba(&full_frame()[0]).expect("rgba"));
-        assert!(
-            to_444 * 4.0 < to_420,
-            "expected the chroma-only update to complete YUV444: error {to_444:.2} vs {to_420:.2}"
-        );
-    }
-
-    #[test]
-    fn avc444v2_recreated_surface_drops_the_old_frame() {
-        // CreateSurface for an id in use starts a new surface; a chroma-only
-        // update must not refine the old surface's luma.
-        let (y, u, v) = striped_source();
-        let (main, aux) = split_v2(&y, &u, &v);
-        let (main_h264, aux_h264) = encode_views(&main, &aux);
-        let (mut client, updates) = client_with_surface();
-
-        send(&mut client, &luma_only(&main_h264)).expect("luma-only update");
-        create_surface_1(&mut client);
-        send(&mut client, &chroma_only(&aux_h264)).expect("chroma-only update");
-
-        assert_eq!(
-            updates.lock().expect("lock").len(),
-            1,
-            "painted chroma over the old surface's luma"
-        );
-    }
-
-    #[test]
-    fn avc444v1_through_the_client_keeps_full_chroma() {
-        let (y, u, v) = striped_source();
-        let (main, aux) = split_v1(&y, &u, &v);
-        let (main_h264, aux_h264) = encode_views(&main, &aux);
-        let (mut client, updates) = client_with_surface();
-
-        send_as(
-            &mut client,
-            Codec1Type::Avc444,
-            &Avc444BitmapStream {
-                encoding: Encoding::LUMA_AND_CHROMA,
-                stream1: avc420_stream(&main_h264, &full_frame()),
-                stream2: Some(avc420_stream(&aux_h264, &full_frame())),
-            },
-        )
-        .expect("v1 update");
-
-        let updates = updates.lock().expect("lock").clone();
-        assert_eq!(updates.len(), 1, "one bitmap update");
-        let (rect, got) = &updates[0];
-        assert_eq!(rect, &full_frame()[0]);
-        let mut full = Yuv444Frame::new(W, H).expect("frame");
-        full.apply_main_view(&main.view(), &full_frame()).expect("main");
-        full.apply_auxiliary_view_v1(&aux.view(), &full_frame()).expect("aux");
-        let mut luma_only = Yuv444Frame::new(W, H).expect("frame");
-        luma_only.apply_main_view(&main.view(), &full_frame()).expect("main");
-
-        let to_444 = mean_abs_error(got, &full.to_rgba(&full_frame()[0]).expect("rgba"));
-        let to_420 = mean_abs_error(got, &luma_only.to_rgba(&full_frame()[0]).expect("rgba"));
-        assert!(
-            to_444 * 4.0 < to_420,
-            "expected the output to match YUV444, not YUV420: error {to_444:.2} vs {to_420:.2}"
-        );
-    }
-
-    #[test]
-    fn avc444v1_luma_then_chroma_in_separate_updates_combine() {
-        // As for v2: the main view alone (LC = 1), then the auxiliary view
-        // alone (LC = 2), which paints full chroma.
-        let (y, u, v) = striped_source();
-        let (main, aux) = split_v1(&y, &u, &v);
-        let (main_h264, aux_h264) = encode_views(&main, &aux);
-        let (mut client, updates) = client_with_surface();
-
-        send_as(&mut client, Codec1Type::Avc444, &luma_only(&main_h264)).expect("luma-only update");
-        send_as(&mut client, Codec1Type::Avc444, &chroma_only(&aux_h264)).expect("chroma-only update");
-
-        let updates = updates.lock().expect("lock").clone();
-        assert_eq!(updates.len(), 2, "one bitmap update per PDU");
-        let mut full = Yuv444Frame::new(W, H).expect("frame");
-        full.apply_main_view(&main.view(), &full_frame()).expect("main");
-        full.apply_auxiliary_view_v1(&aux.view(), &full_frame()).expect("aux");
-        let mut luma_only = Yuv444Frame::new(W, H).expect("frame");
-        luma_only.apply_main_view(&main.view(), &full_frame()).expect("main");
-        let got = &updates[1].1;
-        let to_444 = mean_abs_error(got, &full.to_rgba(&full_frame()[0]).expect("rgba"));
-        let to_420 = mean_abs_error(got, &luma_only.to_rgba(&full_frame()[0]).expect("rgba"));
-        assert!(
-            to_444 * 4.0 < to_420,
-            "expected the chroma-only update to complete YUV444: error {to_444:.2} vs {to_420:.2}"
-        );
-    }
+    let mut client = GraphicsPipelineClient::new(Box::new(ClientSink), Some(Box::new(RgbaDecoder)));
+    let advertised = client.start(0).expect("client start");
+    let advertised = bytes(&advertised[0]);
+    let mut cursor = ironrdp_core::ReadCursor::new(&advertised);
+    let ironrdp_egfx::pdu::GfxPdu::CapabilitiesAdvertise(caps) =
+        ironrdp_core::decode_cursor(&mut cursor).expect("advertisement")
+    else {
+        panic!("expected a capabilities advertisement");
+    };
+    let versions: Vec<_> = caps.0.iter().map(|cap| cap.version).collect();
+    assert_eq!(
+        versions,
+        [
+            ironrdp_egfx::pdu::CapabilityVersion::V8_1,
+            ironrdp_egfx::pdu::CapabilityVersion::V8
+        ]
+    );
 }

@@ -1,6 +1,7 @@
 use core::cmp::min;
 use std::io;
 
+use crate::bit_reader::BitReader;
 use bitvec::field::BitField as _;
 use bitvec::prelude::*;
 use ironrdp_pdu::codecs::rfx::EntropyAlgorithm;
@@ -20,15 +21,6 @@ macro_rules! write_byte {
             $output = &mut $output[1..];
         } else {
             break;
-        }
-    };
-}
-
-macro_rules! try_read_bits {
-    ($bits:ident, $n:expr) => {
-        match $bits.read($n) {
-            Some(value) => value,
-            None => break,
         }
     };
 }
@@ -267,19 +259,34 @@ pub fn decode(mode: EntropyAlgorithm, tile: &[u8], mut output: &mut [i16]) -> Re
 
     let mut bits = BitReader::new(tile);
 
-    while bits.remaining() != 0 && !output.is_empty() {
+    while !bits.is_empty() && !output.is_empty() {
         match CompressionMode::from(k) {
             CompressionMode::RunLength => {
-                let number_of_zeros = bits.skip_run(false);
-                try_read_bits!(bits, 1);
-                let run = count_run(number_of_zeros, &mut k, &mut kp) + try_read_bits!(bits, k as usize);
+                let number_of_zeros = bits.skip_leading(false);
+                if bits.read(1).is_none() {
+                    break;
+                }
+                // `count_run` advances `k`, and the run's low bits are then read
+                // with the updated `k`. Order matters.
+                let run = count_run(number_of_zeros, &mut k, &mut kp);
+                let Some(run_low_bits) = bits.read(k) else {
+                    break;
+                };
+                let run = run + run_low_bits;
 
-                let sign_bit = try_read_bits!(bits, 1) as u8;
+                let Some(sign_bit) = bits.read(1) else {
+                    break;
+                };
 
-                let number_of_ones = bits.skip_run(true);
-                try_read_bits!(bits, 1);
+                let number_of_ones = bits.skip_leading(true);
+                if bits.read(1).is_none() {
+                    break;
+                }
 
-                let code_remainder = try_read_bits!(bits, kr as usize) + ((number_of_ones as u32) << kr);
+                let Some(remainder) = bits.read(kr) else {
+                    break;
+                };
+                let code_remainder = remainder + ((number_of_ones as u32) << kr);
 
                 update_parameters_according_to_number_of_ones(number_of_ones, &mut kr, &mut krp);
                 kp = kp.saturating_sub(DN_GR);
@@ -288,15 +295,20 @@ pub fn decode(mode: EntropyAlgorithm, tile: &[u8], mut output: &mut [i16]) -> Re
                 let magnitude = compute_rl_magnitude(sign_bit, code_remainder)?;
 
                 let size = min(run as usize, output.len());
-                fill(&mut output[..size], 0);
+                output[..size].fill(0);
                 output = &mut output[size..];
                 write_byte!(output, magnitude);
             }
             CompressionMode::GolombRice => {
-                let number_of_ones = bits.skip_run(true);
-                try_read_bits!(bits, 1);
+                let number_of_ones = bits.skip_leading(true);
+                if bits.read(1).is_none() {
+                    break;
+                }
 
-                let code_remainder = try_read_bits!(bits, kr as usize) + ((number_of_ones as u32) << kr);
+                let Some(remainder) = bits.read(kr) else {
+                    break;
+                };
+                let code_remainder = remainder + ((number_of_ones as u32) << kr);
 
                 update_parameters_according_to_number_of_ones(number_of_ones, &mut kr, &mut krp);
 
@@ -308,7 +320,9 @@ pub fn decode(mode: EntropyAlgorithm, tile: &[u8], mut output: &mut [i16]) -> Re
                     EntropyAlgorithm::Rlgr3 => {
                         let n_index = compute_n_index(code_remainder);
 
-                        let val1 = try_read_bits!(bits, n_index);
+                        let Some(val1) = bits.read(n_index) else {
+                            break;
+                        };
                         let val2 = code_remainder
                             .checked_sub(val1)
                             .ok_or(RlgrError::InvalidIntegralConversion("code remainder - val1"))?;
@@ -332,92 +346,9 @@ pub fn decode(mode: EntropyAlgorithm, tile: &[u8], mut output: &mut [i16]) -> Re
     }
 
     // Fill remaining buffer with zeros.
-    fill(output, 0);
+    output.fill(0);
 
     Ok(())
-}
-
-fn fill(buffer: &mut [i16], value: i16) {
-    for v in buffer {
-        *v = value;
-    }
-}
-
-/// Reads a tile's bits most significant first, through a 64-bit window
-/// instead of a bit slice: RLGR decoding is most of a progressive tile's cost.
-struct BitReader<'a> {
-    data: &'a [u8],
-    /// Position in bits.
-    pos: usize,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.data.len() * 8 - self.pos
-    }
-
-    /// The next 64 bits, left-aligned, zero past the end.
-    fn peek64(&self) -> u64 {
-        let byte = self.pos / 8;
-        let shift = self.pos % 8;
-        let mut window = match self.data.get(byte..byte + 8) {
-            // A plain load; copying into a buffer calls memmove.
-            Some(bytes) => u64::from_be_bytes(bytes.try_into().expect("8 bytes")),
-            None => {
-                let mut buf = [0u8; 8];
-                let tail = &self.data[byte..];
-                buf[..tail.len()].copy_from_slice(tail);
-                u64::from_be_bytes(buf)
-            }
-        } << shift;
-        if shift != 0 && byte + 8 < self.data.len() {
-            window |= u64::from(self.data[byte + 8]) >> (8 - shift);
-        }
-        window
-    }
-
-    /// Reads `n` bits (at most 32) as a big-endian number, or `None` when
-    /// fewer than `n` remain. Zero bits read as 0.
-    fn read(&mut self, n: usize) -> Option<u32> {
-        #![expect(clippy::as_conversions, clippy::cast_possible_truncation, reason = "at most 32 bits")]
-
-        debug_assert!(n <= 32, "RLGR reads at most 32 bits");
-        if n > self.remaining() {
-            return None;
-        }
-        if n == 0 {
-            return Some(0);
-        }
-        let value = (self.peek64() >> (64 - n)) as u32;
-        self.pos += n;
-        Some(value)
-    }
-
-    /// Consumes the run of `value` bits at the current position, up to the
-    /// end of the tile, and returns its length.
-    fn skip_run(&mut self, value: bool) -> usize {
-        #![expect(clippy::as_conversions, reason = "u32-to-usize")]
-
-        let start = self.pos;
-        while self.remaining() > 0 {
-            let window = self.peek64();
-            let run = if value {
-                window.leading_ones()
-            } else {
-                window.leading_zeros()
-            } as usize;
-            let run = min(run, self.remaining());
-            self.pos += run;
-            if run < 64 {
-                break;
-            }
-        }
-        self.pos - start
-    }
 }
 
 fn count_run(number_of_zeros: usize, k: &mut u32, kp: &mut u32) -> u32 {
@@ -432,7 +363,7 @@ fn count_run(number_of_zeros: usize, k: &mut u32, kp: &mut u32) -> u32 {
     .sum()
 }
 
-fn compute_rl_magnitude(sign_bit: u8, code_remainder: u32) -> Result<i16, RlgrError> {
+fn compute_rl_magnitude(sign_bit: u32, code_remainder: u32) -> Result<i16, RlgrError> {
     let rl_magnitude =
         i16::try_from(code_remainder + 1).map_err(|_| RlgrError::InvalidIntegralConversion("code remainder + 1"))?;
 
@@ -470,13 +401,10 @@ fn compute_rlgr3_magnitude(val: u32) -> Result<i16, RlgrError> {
     }
 }
 
-#[expect(clippy::as_conversions, reason = "u32-to-usize")]
-fn compute_n_index(code_remainder: u32) -> usize {
-    if code_remainder == 0 {
-        return 0;
-    }
-
-    (32 - code_remainder.leading_zeros()) as usize
+/// Number of significant bits in `code_remainder`, i.e. the width of the field
+/// that follows it in RLGR3.
+fn compute_n_index(code_remainder: u32) -> u32 {
+    32 - code_remainder.leading_zeros()
 }
 
 fn update_parameters_according_to_number_of_ones(number_of_ones: usize, kr: &mut u32, krp: &mut u32) {
@@ -552,62 +480,5 @@ impl core::error::Error for RlgrError {
 impl From<io::Error> for RlgrError {
     fn from(err: io::Error) -> Self {
         Self::Io(err)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bit_reader_reads_across_byte_boundaries() {
-        let mut bits = BitReader::new(&[0b1011_0011, 0b1100_0101, 0xFF, 0x00, 0xAA, 0x55, 0x0F, 0xF0, 0x81]);
-
-        assert_eq!(bits.read(3), Some(0b101));
-        assert_eq!(bits.read(0), Some(0));
-        assert_eq!(bits.read(7), Some(0b100_1111));
-        assert_eq!(bits.read(10), Some(0b00_0101_1111));
-        // Straddles the end of the first 64-bit window.
-        assert_eq!(bits.read(32), Some(0b1111_0000_0000_1010_1010_0101_0101_0000));
-        assert_eq!(bits.remaining(), 20);
-        assert_eq!(bits.read(20), Some(0b1111_1111_0000_1000_0001));
-        assert_eq!(bits.remaining(), 0);
-    }
-
-    #[test]
-    fn bit_reader_refuses_reads_past_the_end() {
-        let mut bits = BitReader::new(&[0xAB, 0xCD]);
-
-        assert_eq!(bits.read(5), Some(0b10101));
-        assert_eq!(bits.read(12), None);
-        // A refused read consumes nothing.
-        assert_eq!(bits.remaining(), 11);
-        assert_eq!(bits.read(11), Some(0b011_1100_1101));
-        assert_eq!(bits.read(1), None);
-        assert_eq!(bits.read(0), Some(0));
-    }
-
-    #[test]
-    fn bit_reader_zero_run_stops_at_the_end() {
-        let mut bits = BitReader::new(&[0xFF, 0x00, 0x00]);
-
-        assert_eq!(bits.read(4), Some(0xF));
-        assert_eq!(bits.skip_run(true), 4);
-        assert_eq!(bits.skip_run(false), 16);
-        assert_eq!(bits.remaining(), 0);
-        assert_eq!(bits.skip_run(false), 0);
-    }
-
-    #[test]
-    fn bit_reader_one_run_stops_at_the_end() {
-        // A run longer than one 64-bit window.
-        let mut data = vec![0x0F];
-        data.extend([0xFF; 11]);
-        let mut bits = BitReader::new(&data);
-
-        assert_eq!(bits.skip_run(false), 4);
-        assert_eq!(bits.skip_run(true), 92);
-        assert_eq!(bits.remaining(), 0);
-        assert_eq!(bits.read(1), None);
     }
 }

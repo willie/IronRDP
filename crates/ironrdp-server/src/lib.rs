@@ -29,13 +29,17 @@ mod urbdrc;
 
 pub use clipboard::CliprdrServerFactory;
 pub use display::{
-    BitmapUpdate, ColorPointer, DesktopSize, DisplayUpdate, Framebuffer, LargePointer, PixelFormat, RGBAPointer,
-    RdpServerDisplay, RdpServerDisplayUpdates,
+    BitmapUpdate, ColorPointer, DesktopSize, DisplayContext, DisplayUpdate, Framebuffer, LargePointer, PixelFormat,
+    RGBAPointer, RdpServerDisplay, RdpServerDisplayUpdates,
 };
 pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoServerMessage};
+#[cfg(all(feature = "__test", feature = "qoiz"))]
+pub use encoder::qoiz::Compressor as QoizCompressor;
+#[cfg(feature = "__test")]
+pub use encoder::{RemoteFxCodec, UpdateEncoder, UpdateEncoderCodecs};
 pub use error::{ServerError, ServerErrorExt, ServerErrorKind, ServerResult, ServerResultExt};
 #[cfg(feature = "egfx")]
-pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
+pub use gfx::{EgfxServerMessage, GfxContext, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;
@@ -52,11 +56,19 @@ pub use rdpei::{
     RdpeiServerFactory, ScReadyFeatures, TouchContact, TouchContactDataFlags, TouchContactFields, TouchContactFlags,
     TouchEventPdu, TouchFrame,
 };
+#[cfg(feature = "__test")]
+pub use server::autodetect_response_from_sub_header;
+#[cfg(all(feature = "__test", feature = "egfx"))]
+pub use server::autodetect_sub_header;
+#[cfg(feature = "__test")]
+pub use server::pick_remotefx_codec;
 pub use server::{
-    AutoReconnectCookieHandle, BoundConnection, ConnectionBinder, ConnectionHandler, ConnectionInfo, ConnectionPolicy,
-    CredentialDecision, CredentialValidationError, CredentialValidator, Credentials, ErrorInfoDisconnectHandle,
-    ExactMatchCredentialValidator, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
-    ServerEventSender, StaticChannelFactory, TransportTls, pick_remotefx_entropy_coder,
+    AuthenticatedConnection, AutoReconnectCookieHandle, BoundConnection, ConnectionBinder, ConnectionHandler,
+    ConnectionInfo, ConnectionPolicy, ConnectionSource, CredentialDecision, CredentialValidationError,
+    CredentialValidator, Credentials, ErrorInfoDisconnectHandle, ExactMatchCredentialValidator, IncomingConnection,
+    NextConnection, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
+    ServerEventSender, ServerRedirectionHandle, SessionOutcome, StaticChannelFactory, TransportTls,
+    pick_remotefx_entropy_coder,
 };
 pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 #[cfg(feature = "usb")]
@@ -71,6 +83,6 @@ pub mod bench {
             pub use crate::encoder::rfx::bench::{rfx_enc, rfx_enc_tile};
         }
 
-        pub use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
+        pub use crate::encoder::{RemoteFxCodec, UpdateEncoder, UpdateEncoderCodecs};
     }
 }

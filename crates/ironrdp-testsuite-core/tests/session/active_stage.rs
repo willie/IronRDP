@@ -400,6 +400,7 @@ fn active_stage_widens_after_a_reset_and_records_damage() {
                 EGFX,
                 ironrdp_egfx::CHANNEL_NAME.to_owned(),
             ))),
+            None,
         )
         .expect("open the EGFX channel");
 
@@ -432,7 +433,7 @@ fn active_stage_widens_after_a_reset_and_records_damage() {
     ));
     let updates = graphics_updates(
         active_stage
-            .process(&mut image, Action::X224, &gfx(&first))
+            .process(&mut image, Action::X224, &gfx(&first), None)
             .expect("first frame"),
     );
     assert_eq!((image.width(), image.height()), (64, 32));
@@ -456,7 +457,7 @@ fn active_stage_widens_after_a_reset_and_records_damage() {
     );
     let updates = graphics_updates(
         active_stage
-            .process(&mut image, Action::X224, &gfx(&second))
+            .process(&mut image, Action::X224, &gfx(&second), None)
             .expect("second frame"),
     );
     assert_eq!(updates.len(), 1, "one graphics update, got {updates:?}");
@@ -467,4 +468,87 @@ fn active_stage_widens_after_a_reset_and_records_damage() {
             .any(|region| (region.left, region.top, region.right, region.bottom) == (40, 20, 47, 27)),
         "the fill is recorded as damage, got {damage:?}"
     );
+}
+
+/// A surface the server maps to a RemoteApp window is not part of the image:
+/// `composite_graphics_pipeline` hands its pixels back as a window update, once,
+/// so they don't pile up in the pipeline's memory budget.
+#[test]
+fn composite_graphics_pipeline_takes_the_window_updates() {
+    use ironrdp_core::encode_vec;
+    use ironrdp_dvc::DvcProcessor as _;
+    use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+    use ironrdp_egfx::pdu::{
+        Color, CreateSurfacePdu, EndFramePdu, GfxPdu, MapSurfaceToWindowPdu, PixelFormat as GfxPixelFormat,
+        ResetGraphicsPdu, SolidFillPdu, StartFramePdu, Timestamp,
+    };
+    use ironrdp_graphics::zgfx::wrap_uncompressed;
+    use ironrdp_session::composite_graphics_pipeline;
+
+    struct Handler;
+    impl GraphicsPipelineHandler for Handler {}
+
+    let mut gfx = GraphicsPipelineClient::new(Box::new(Handler), None);
+    for pdu in [
+        GfxPdu::ResetGraphics(ResetGraphicsPdu {
+            width: 64,
+            height: 32,
+            monitors: Vec::new(),
+        }),
+        GfxPdu::CreateSurface(CreateSurfacePdu {
+            surface_id: 1,
+            width: 8,
+            height: 4,
+            pixel_format: GfxPixelFormat::XRgb,
+        }),
+        GfxPdu::MapSurfaceToWindow(MapSurfaceToWindowPdu {
+            surface_id: 1,
+            window_id: 0x42,
+            mapped_width: 4,
+            mapped_height: 2,
+        }),
+        GfxPdu::StartFrame(StartFramePdu {
+            timestamp: Timestamp {
+                milliseconds: 0,
+                seconds: 0,
+                minutes: 0,
+                hours: 0,
+            },
+            frame_id: 1,
+        }),
+        GfxPdu::SolidFill(SolidFillPdu {
+            surface_id: 1,
+            fill_pixel: Color {
+                b: 0x30,
+                g: 0x20,
+                r: 0x10,
+                xa: 0xFF,
+            },
+            rectangles: vec![ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 8,
+                bottom: 4,
+            }],
+        }),
+        GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }),
+    ] {
+        gfx.process(0, &wrap_uncompressed(&encode_vec(&pdu).expect("encode PDU")))
+            .expect("process PDU");
+    }
+
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 2, 2);
+    let composited = composite_graphics_pipeline(&mut gfx, &mut image).expect("composite");
+    assert!(composited.region.is_none(), "a window surface painted the image");
+    // The mapping exposes its area too, so the fill may arrive as more than one update.
+    assert!(!composited.window_updates.is_empty(), "no window update");
+    for update in &composited.window_updates {
+        assert_eq!(update.window_id, 0x42);
+        // Only the mapped top-left 4x2 area of the surface reaches the window.
+        assert_eq!((update.width, update.height), (4, 2));
+        assert_eq!(update.data, [0x10, 0x20, 0x30, 0xFF].repeat(4 * 2));
+    }
+
+    let again = composite_graphics_pipeline(&mut gfx, &mut image).expect("composite again");
+    assert!(again.window_updates.is_empty(), "drained window updates came back");
 }
