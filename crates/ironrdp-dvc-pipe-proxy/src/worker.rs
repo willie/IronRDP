@@ -15,7 +15,7 @@ const IO_BUFFER_SIZE: usize = 1024 * 64; // 64K
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
-pub(crate) type OnWriteDvcMessage = Box<dyn Fn(u32, Vec<SvcMessage>) -> PduResult<()> + Send>;
+pub(crate) type OnWriteDvcMessage = Arc<dyn Fn(u32, Vec<SvcMessage>) -> PduResult<()> + Send + Sync>;
 
 pub(crate) struct WorkerCtx {
     pub(crate) on_write_dvc: OnWriteDvcMessage,
