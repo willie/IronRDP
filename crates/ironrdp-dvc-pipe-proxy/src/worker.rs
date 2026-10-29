@@ -183,8 +183,16 @@ async fn process_client<P: OsPipe>(ctx: &mut BridgedWorkerCtx) -> Result<NextWor
                     }
                 };
 
-                if let Err(error) = pipe.write_all(&data).await
-                {
+                // A peer that stops reading stalls the write; the abort must still release the
+                // pipe, or a restarted worker cannot take it over.
+                let written = tokio::select! {
+                    () = ctx.abort_event.notified() => {
+                        debug!(%channel_name, %pipe_name, "Received abort signal while writing to DVC pipe");
+                        return Ok(NextWorkerState::Abort);
+                    }
+                    written = pipe.write_all(&data) => written,
+                };
+                if let Err(error) = written {
                     error!(%channel_name, %pipe_name, ?error, "Failed to write to DVC pipe");
                     return Ok(NextWorkerState::Reconnect);
                 }
