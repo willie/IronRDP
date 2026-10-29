@@ -1,4 +1,4 @@
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use ironrdp_core::impl_as_any;
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
@@ -30,12 +30,12 @@ impl DvcNamedPipeProxy {
     /// IronRDP active session loop.
     pub fn new<F>(channel_name: &str, named_pipe_name: &str, dvc_write_callback: F) -> Self
     where
-        F: Fn(u32, Vec<SvcMessage>) -> PduResult<()> + Send + Sync + 'static,
+        F: Fn(u32, Vec<SvcMessage>) -> PduResult<()> + Send + 'static,
     {
         Self {
             channel_name: channel_name.to_owned(),
             named_pipe_name: named_pipe_name.to_owned(),
-            dvc_write_callback: Arc::new(dvc_write_callback),
+            dvc_write_callback: Arc::new(Mutex::new(dvc_write_callback)),
             worker: None,
         }
     }
