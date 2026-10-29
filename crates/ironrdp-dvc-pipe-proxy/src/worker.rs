@@ -1,5 +1,5 @@
 use core::time::Duration;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
 use ironrdp_dvc::encode_dvc_messages;
 use ironrdp_pdu::PduResult;
@@ -15,7 +15,8 @@ const IO_BUFFER_SIZE: usize = 1024 * 64; // 64K
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
-pub(crate) type OnWriteDvcMessage = Arc<dyn Fn(u32, Vec<SvcMessage>) -> PduResult<()> + Send + Sync>;
+/// Shared by every worker the proxy starts; the lock stands in for a `Sync` bound on the callback.
+pub(crate) type OnWriteDvcMessage = Arc<Mutex<dyn Fn(u32, Vec<SvcMessage>) -> PduResult<()> + Send>>;
 
 pub(crate) struct WorkerCtx {
     pub(crate) on_write_dvc: OnWriteDvcMessage,
@@ -166,7 +167,8 @@ async fn process_client<P: OsPipe>(ctx: &mut BridgedWorkerCtx) -> Result<NextWor
                 )
                 .map_err(DvcPipeProxyError::EncodeDvcMessage)?;
 
-                if let Err(error) = (ctx.on_write_dvc)(ctx.channel_id, messages) {
+                let on_write_dvc = ctx.on_write_dvc.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Err(error) = on_write_dvc(ctx.channel_id, messages) {
                     error!(%channel_name, %pipe_name, ?error, "DVC pipe proxy write callback failed");
                 }
             }
@@ -181,8 +183,16 @@ async fn process_client<P: OsPipe>(ctx: &mut BridgedWorkerCtx) -> Result<NextWor
                     }
                 };
 
-                if let Err(error) = pipe.write_all(&data).await
-                {
+                // A peer that stops reading stalls the write; the abort must still release the
+                // pipe, or a restarted worker cannot take it over.
+                let written = tokio::select! {
+                    () = ctx.abort_event.notified() => {
+                        debug!(%channel_name, %pipe_name, "Received abort signal while writing to DVC pipe");
+                        return Ok(NextWorkerState::Abort);
+                    }
+                    written = pipe.write_all(&data) => written,
+                };
+                if let Err(error) = written {
                     error!(%channel_name, %pipe_name, ?error, "Failed to write to DVC pipe");
                     return Ok(NextWorkerState::Reconnect);
                 }
