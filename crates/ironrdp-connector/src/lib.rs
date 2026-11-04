@@ -8,7 +8,7 @@ mod connection;
 pub mod connection_activation;
 mod connection_finalization;
 pub mod credssp;
-mod entra;
+pub mod entra;
 mod license_exchange;
 #[cfg(all(feature = "remote-guard", not(feature = "__test")))]
 #[expect(
@@ -39,7 +39,7 @@ pub use self::connection::{
     MultitransportResult, encode_send_data_request,
 };
 pub use self::connection_finalization::{ConnectionFinalizationSequence, ConnectionFinalizationState};
-pub use self::license_exchange::{LicenseExchangeSequence, LicenseExchangeState};
+pub use self::license_exchange::{LicenseExchangeSequence, LicenseExchangeState, LicenseRng};
 pub use self::server_name::ServerName;
 pub use crate::license_exchange::LicenseCache;
 

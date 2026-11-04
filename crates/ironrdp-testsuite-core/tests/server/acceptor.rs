@@ -6,8 +6,9 @@ use std::io;
 use std::rc::Rc;
 
 use ironrdp_acceptor::{
-    Acceptor, ChannelConnectionSequence, ConnectionSetupHandler, FinalizationSequence, MultitransportSecurityRng,
-    ReceivedCredentials, accept_begin, accept_credssp_with, accept_finalize, accept_finalize_with,
+    Acceptor, AcceptorResult, ChannelConnectionSequence, ConnectionSetupHandler, FinalizationSequence,
+    MultitransportSecurityRng, ReceivedCredentials, accept_begin, accept_credssp_with, accept_finalize,
+    accept_finalize_with,
 };
 use ironrdp_async::bytes::BytesMut;
 use ironrdp_async::{Framed, FramedRead, FramedWrite, NetworkClient, StreamWrapper};
@@ -274,10 +275,11 @@ fn drive_to_secure_settings_exchange(
     acceptor: &mut Acceptor,
     client_blocks: ironrdp_pdu::gcc::ClientGccBlocks,
 ) -> (u16, u16, Option<u16>, Option<MultiTransportFlags>) {
-    drive_to_secure_settings_exchange_with_info(acceptor, client_blocks, &CLIENT_INFO_PDU_BUFFER)
+    drive_to_secure_settings_exchange_with_client_info(acceptor, client_blocks, &CLIENT_INFO_PDU_BUFFER)
 }
 
-fn drive_to_secure_settings_exchange_with_info(
+/// [`drive_to_secure_settings_exchange`], sending `client_info` as the encoded Client Info PDU.
+fn drive_to_secure_settings_exchange_with_client_info(
     acceptor: &mut Acceptor,
     client_blocks: ironrdp_pdu::gcc::ClientGccBlocks,
     client_info: &[u8],
@@ -378,7 +380,7 @@ fn rail_acceptor_waiting_confirm() -> (Acceptor, u16, u16) {
     let mut gcc = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
     gcc.network = None;
     let (user_channel_id, io_channel_id, _, _) =
-        drive_to_secure_settings_exchange_with_info(&mut acceptor, gcc, &encode_vec(&info).unwrap());
+        drive_to_secure_settings_exchange_with_client_info(&mut acceptor, gcc, &encode_vec(&info).unwrap());
     acceptor.step(&[], None, &mut WriteBuf::new()).unwrap();
     acceptor.step(&[], None, &mut WriteBuf::new()).unwrap();
     acceptor.step(&[], None, &mut WriteBuf::new()).unwrap();
@@ -965,22 +967,51 @@ fn accept(monitors: Option<Vec<Monitor>>) -> Acceptor {
     let mut client_blocks = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
     client_blocks.network = None;
     client_blocks.monitor = monitors.map(|monitors| ClientMonitorData { monitors });
-
     let mut acceptor = multitransport_acceptor(None);
 
     let (user_channel_id, io_channel_id, ..) = drive_to_secure_settings_exchange(&mut acceptor, client_blocks);
 
     acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // LicensingExchange
     acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // MultitransportBootstrapping: nothing to send
-    acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // CapabilitiesSendServer: sends Demand Active
 
+    acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // CapabilitiesSendServer: sends Demand Active
     let confirm_active = encode_send_data_request(user_channel_id, io_channel_id, &CLIENT_DEMAND_ACTIVE_PDU_BUFFER);
     acceptor.step(&confirm_active, None, &mut WriteBuf::new()).unwrap();
-
     finish_finalization(&mut acceptor, user_channel_id, io_channel_id);
     assert_eq!(acceptor.state().name(), "Connected");
-
     acceptor
+}
+
+const DESKTOP_SIZE: DesktopSize = DesktopSize {
+    width: 1920,
+    height: 1080,
+};
+
+/// Drives a fresh acceptor through the whole connection sequence, from the Connection Request to `Connected`, with
+/// `client_blocks` as the client's GCC blocks and `client_info` as its encoded Client Info PDU.
+/// Returns the connected acceptor, its result, and the user and I/O channel ids, which a test that reactivates the
+/// acceptor needs.
+fn accepted(
+    client_blocks: ironrdp_pdu::gcc::ClientGccBlocks,
+    client_info: &[u8],
+) -> (Acceptor, AcceptorResult, u16, u16) {
+    let mut acceptor = Acceptor::new(SecurityProtocol::SSL, DESKTOP_SIZE, Vec::new(), None);
+    let (user_channel_id, io_channel_id, ..) =
+        drive_to_secure_settings_exchange_with_client_info(&mut acceptor, client_blocks, client_info);
+    acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // LicensingExchange
+    acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // MultitransportBootstrapping
+    let result = result_after_activation(&mut acceptor, user_channel_id, io_channel_id);
+    (acceptor, result, user_channel_id, io_channel_id)
+}
+
+/// Runs the Capability Exchange and Connection Finalization phases and returns the acceptor's result.
+fn result_after_activation(acceptor: &mut Acceptor, user_channel_id: u16, io_channel_id: u16) -> AcceptorResult {
+    acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // CapabilitiesSendServer
+    let confirm_active = encode_send_data_request(user_channel_id, io_channel_id, &CLIENT_DEMAND_ACTIVE_PDU_BUFFER);
+    acceptor.step(&confirm_active, None, &mut WriteBuf::new()).unwrap();
+    finish_finalization(acceptor, user_channel_id, io_channel_id);
+    assert_eq!(acceptor.state().name(), "Connected");
+    acceptor.get_result().expect("a connected acceptor has a result")
 }
 
 /// The client's PDUs of the connection finalization, in the order it sends them.
@@ -1025,10 +1056,10 @@ fn finish_finalization(sequence: &mut impl Sequence, user_channel_id: u16, io_ch
 
 /// Returns the monitors the acceptor hands back in its result after [`accept`] with `monitors`.
 fn client_monitors_after_accepting(monitors: Option<Vec<Monitor>>) -> Vec<Monitor> {
-    accept(monitors)
-        .get_result()
-        .expect("a connected acceptor has a result")
-        .client_monitors
+    let mut client_blocks = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
+    client_blocks.network = None;
+    client_blocks.monitor = monitors.map(|monitors| ClientMonitorData { monitors });
+    accepted(client_blocks, &CLIENT_INFO_PDU_BUFFER).1.client_monitors
 }
 
 /// The client's monitors reach `AcceptorResult::client_monitors` as sent,
@@ -1173,6 +1204,122 @@ fn reactivation_backlog_rejects_frames_beyond_sixteen_mib() {
     }
     let error = acceptor.step(&frame, None, &mut WriteBuf::new()).unwrap_err();
     assert!(error.to_string().contains("backlog"));
+}
+
+/// The encoded Client Info PDU of [`CLIENT_INFO_UNICODE`] with `flags` added, and the flags it then carries.
+fn client_info_with_flags(flags: ClientInfoFlags) -> (Vec<u8>, ClientInfoFlags) {
+    let mut client_info = CLIENT_INFO_UNICODE.clone();
+    client_info.flags |= flags;
+    let sent = client_info.flags;
+    let pdu = encode_vec(&ClientInfoPdu {
+        security_header: BasicSecurityHeader {
+            flags: BasicSecurityHeaderFlags::INFO_PKT,
+        },
+        client_info,
+    })
+    .unwrap();
+    (pdu, sent)
+}
+
+/// The flags of the client's Info Packet, MS-RDPBCGR [2.2.1.11.1.1] Info Packet (TS_INFO_PACKET), reach
+/// `AcceptorResult::client_info_flags` as sent, the audio ones included.
+///
+/// [2.2.1.11.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/732394f5-e2b5-4ac5-8a0a-35345386b0d1
+// oracle: spec MS-RDPBCGR §2.2.1.11.1.1
+#[test]
+fn client_info_flags_are_kept_as_sent() {
+    let (client_info, flags) =
+        client_info_with_flags(ClientInfoFlags::NO_AUDIO_PLAYBACK | ClientInfoFlags::AUDIO_CAPTURE);
+
+    let mut client_blocks = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
+    client_blocks.network = None;
+    assert_eq!(accepted(client_blocks, &client_info).1.client_info_flags, flags);
+}
+
+/// An MS-RDPBCGR [1.3.1.3] Deactivation-Reactivation Sequence re-runs only the Capability Exchange and Connection
+/// Finalization phases, so the client doesn't send its Client Info PDU again, and the reactivated acceptor hands back
+/// the flags it sent the first time.
+///
+/// [1.3.1.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
+// oracle: spec MS-RDPBCGR §1.3.1.3
+#[test]
+fn client_info_flags_survive_reactivation() {
+    let (client_info, flags) =
+        client_info_with_flags(ClientInfoFlags::NO_AUDIO_PLAYBACK | ClientInfoFlags::AUDIO_CAPTURE);
+
+    let mut client_blocks = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
+    client_blocks.network = None;
+    let (acceptor, result, user_channel_id, io_channel_id) = accepted(client_blocks, &client_info);
+
+    let mut acceptor = Acceptor::new_deactivation_reactivation(acceptor, result.static_channels, DESKTOP_SIZE)
+        .expect("rebuild the acceptor for reactivation");
+    let result = result_after_activation(&mut acceptor, user_channel_id, io_channel_id);
+
+    assert!(result.reactivation);
+    assert_eq!(result.client_info_flags, flags);
+}
+
+/// The client's GCC blocks with `desktop` and `device` as the `desktopScaleFactor` and `deviceScaleFactor` of its
+/// Client Core Data, and the optional fields that precede them filled in so that they are encoded.
+fn client_blocks_with_scale_factors(desktop: Option<u32>, device: Option<u32>) -> ironrdp_pdu::gcc::ClientGccBlocks {
+    let mut client_blocks = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
+    client_blocks.network = None;
+    let optional_data = &mut client_blocks.core.optional_data;
+    optional_data.desktop_physical_width = Some(0);
+    optional_data.desktop_physical_height = Some(0);
+    optional_data.desktop_orientation = Some(0);
+    optional_data.desktop_scale_factor = desktop;
+    optional_data.device_scale_factor = device;
+    client_blocks
+}
+
+/// MS-RDPBCGR [2.2.1.3.2] Client Core Data (TS_UD_CS_CORE): `desktopScaleFactor` is valid in 100..=500 and
+/// `deviceScaleFactor` is 100, 140 or 180, and each MUST be ignored when it is out of range, when the other is out of
+/// range, or when the other is absent. Neither half of a pair reaches the acceptor alone: a `deviceScaleFactor` can't
+/// be sent without the `desktopScaleFactor` that precedes it, and the decoder rejects a `desktopScaleFactor` without a
+/// `deviceScaleFactor`.
+///
+/// [2.2.1.3.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/00f1da4a-ee9c-421a-852f-c19f92343d73
+// oracle: spec MS-RDPBCGR §2.2.1.3.2
+#[rstest::rstest]
+#[case::retina_pair(Some(200), Some(100), (Some(200), Some(100)))]
+#[case::lowest_desktop_highest_device(Some(100), Some(180), (Some(100), Some(180)))]
+#[case::highest_desktop(Some(500), Some(140), (Some(500), Some(140)))]
+#[case::invalid_device_drops_both(Some(200), Some(250), (None, None))]
+#[case::desktop_below_range_drops_both(Some(50), Some(140), (None, None))]
+#[case::desktop_above_range_drops_both(Some(501), Some(100), (None, None))]
+#[case::both_absent(None, None, (None, None))]
+fn scale_factors_are_reported_only_as_a_valid_pair(
+    #[case] desktop: Option<u32>,
+    #[case] device: Option<u32>,
+    #[case] expected: (Option<u32>, Option<u32>),
+) {
+    let (_, result, ..) = accepted(
+        client_blocks_with_scale_factors(desktop, device),
+        &CLIENT_INFO_PDU_BUFFER,
+    );
+    assert_eq!((result.desktop_scale_factor, result.device_scale_factor), expected);
+}
+
+/// An MS-RDPBCGR [1.3.1.3] Deactivation-Reactivation Sequence doesn't resend the GCC Client Core Data, so the
+/// reactivated acceptor hands back the scale factors the client sent the first time.
+///
+/// [1.3.1.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
+// oracle: spec MS-RDPBCGR §1.3.1.3
+#[test]
+fn scale_factors_survive_reactivation() {
+    let client_blocks = client_blocks_with_scale_factors(Some(200), Some(140));
+    let (acceptor, result, user_channel_id, io_channel_id) = accepted(client_blocks, &CLIENT_INFO_PDU_BUFFER);
+
+    let mut acceptor = Acceptor::new_deactivation_reactivation(acceptor, result.static_channels, DESKTOP_SIZE)
+        .expect("rebuild the acceptor for reactivation");
+    let result = result_after_activation(&mut acceptor, user_channel_id, io_channel_id);
+
+    assert!(result.reactivation);
+    assert_eq!(
+        (result.desktop_scale_factor, result.device_scale_factor),
+        (Some(200), Some(140))
+    );
 }
 
 #[derive(Default)]

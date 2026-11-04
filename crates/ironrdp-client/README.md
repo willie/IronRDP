@@ -28,6 +28,12 @@ The high-level client supports direct and RDS Gateway transports for Entra authe
 Entra authentication also rejects certificate-validation override callbacks.
 Certificate validation uses platform trust and the server's DNS name; Entra P2P certificate validation using tenant roots and a device ID is not implemented.
 The embedder owns browser UI and must choose the target host name or device ID that matches the RDP server.
+
+With `entra-auth`, `ConfigBuilder::with_interactive_entra_auth` also enables the undocumented `Microsoft::Windows::RDS::InteractiveEntraAuth` dynamic channel, which Windows App leaves off by default.
+Through it, the session host asks for a fresh Entra sign-in during the session: the client runs TLS inside the channel, reads the host's Entra device ID from its certificate's common name, and raises `RdpOutputEvent::InteractiveEntraAuthRequested`.
+The embedder answers with an `EntraAuthSession` for that device and the tenant's DER-encoded Entra P2P root certificates; the host certificate must be issued by one of those roots before the RDS AAD exchange runs inside the channel.
+The interactive Entra authentication section of `crates/ironrdp-w365/PROTOCOL.md` describes the exchange.
+The channel follows the Windows App 2.0.1485.0 client and has not been verified against a live session host.
 This flow uses Microsoft's documented public-cloud authority and requires a new authorization flow after the access token expires.
 When combined with `gateway`, `gatewaybrokeringtype:i:1` enables Azure Virtual Desktop orchestration over WebSocket, acquiring gateway and session-host PoP tokens through Windows Web Account Manager on Windows, `OAuthAvdTokenProvider` (loopback PKCE, device code, and refresh-token cache) across platforms, or a custom `AvdTokenProvider` set with `ConfigBuilder::with_avd_token_provider`.
 Live Entra host interoperability has not been verified.
@@ -53,10 +59,14 @@ Capture uses Media Foundation and is only available on Windows; cameras attached
 Raw camera frames are encoded to H.264 unless the camera produces H.264 or MJPEG itself or `CameraConfig::encode_video` is off.
 
 The graphics pipeline (MS-RDPEGFX) and video optimized remoting share one H.264 decoder: on Windows the one shipped with Windows, through Media Foundation; the `openh264` feature switches the default to a decoder built from the bundled OpenH264 sources, which is the only default elsewhere. `ConfigBuilder::with_h264_decoder` replaces it, or removes it with `None`. The graphics pipeline's decoder starts during the connection sequence and is awaited when the graphics channel opens, so a slow decoder start does not delay connecting; if it fails, no AVC capability set is advertised.
+Each further surface sending H.264 gets its own decoder when its first update arrives, created on the thread processing the channel.
 With a decoder, the graphics pipeline is advertised by default with capability versions 10.7 down to 10 (AVC444 and AVC444v2), 8.1 (AVC420) and 8; `ConfigBuilder::with_graphics_pipeline(false)` or the `ironrdp_egfx:i:0` `.rdp` property opts out, as mstsc has no `.rdp` key for it. Without a decoder the graphics pipeline is off unless enabled the same way, and then only offers the codecs that need no H.264 decoder.
 The optional `video` feature accepts MS-RDPEVOR video optimized remoting and MS-RDPEGT geometry tracking when the H.264 decoder is available. Without a decoder, or with `videoplaybackmode:i:0` as in mstsc, the client keeps declining these channels.
 Windows servers only keep the video channels open when the graphics pipeline is enabled.
 Decoded pictures are shown at their presentation time, scaled and clipped to the tracked geometry, and composited into the framebuffer like graphics pipeline updates.
+
+The optional `telemetry` feature answers the MS-RDPET telemetry channel with one report per connection: the milliseconds from initiating the connection to opening the graphics pipeline channel and to receiving its first message.
+It is off by default; `ConfigBuilder::with_telemetry(true)` enables it.
 
 When the `gateway` feature is enabled, `Transport::Gateway` uses the MS-TSGU HTTPS WebSocket transport and falls back to legacy dual-channel HTTP when necessary.
 It handles `HTTP_REAUTH_MESSAGE` through a short-lived background reauthentication transport without disrupting the active data transport.
@@ -72,6 +82,9 @@ The optional `usb` feature redirects local USB devices over MS-RDPEUSB (URBDRC) 
 Select devices with `ConfigBuilder::with_usb_redirection` or the `.rdp` `usbdevicestoredirect` property.
 On Windows, only devices bound to the WinUSB driver can be redirected; see that crate for the coverage limits on each platform.
 Through an RD Gateway, USB redirection follows the gateway's Plug and Play device-redirection policy.
+
+The optional `pnp` feature redirects Plug and Play devices over MS-RDPEPNP with [`ironrdp-rdpepnp`](../ironrdp-rdpepnp).
+No native backend exists: the embedder passes the device descriptions and a `PnpBackend` factory to `ConfigBuilder::with_pnp_redirection`.
 
 For the end-user RDP client binary, see [`ironrdp-viewer`](../ironrdp-viewer).
 

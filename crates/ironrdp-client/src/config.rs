@@ -438,10 +438,80 @@ pub struct ChannelConfig {
     #[cfg(feature = "location")]
     pub location: bool,
 
+    /// Enable the MS-RDPET telemetry dynamic virtual channel, which reports connection milestones to the server.
+    ///
+    /// Off by default, like the location channel: reporting to the server is opt-in.
+    #[cfg(feature = "telemetry")]
+    pub telemetry: bool,
+
+    /// Enable the MS-RDPETXT text input dynamic virtual channels.
+    ///
+    /// Off by default: the client hosts no input method, so it only tracks the focused remote
+    /// edit control and inserts text committed with [`crate::rdp::RdpInputEvent::CommitText`].
+    #[cfg(feature = "text-input")]
+    pub text_input: bool,
+    /// Values restored to Windows MultiPoint sessions over the MS-RDPADRV `WMSAud` and `WMSDL` channels, or `None`
+    /// to leave both channels unregistered.
+    ///
+    /// Changes the session reports update these settings and raise
+    /// [`RdpOutputEvent::MultipointSettingsChanged`](crate::rdp::RdpOutputEvent::MultipointSettingsChanged).
+    /// USB redirection does not wait for the drive letter protocol to initialize, as MS-RDPADRV requires of a client
+    /// redirecting USB mass storage devices, so combine the two only where that is acceptable.
+    #[cfg(feature = "multipoint")]
+    pub multipoint: Option<crate::multipoint::MultipointSettings>,
+
+    /// Launch URI that enables the Windows 365 virtual desktop control channel.
+    ///
+    /// Windows 365 Cloud PCs use the channel in Boot and Switch mode; `None` leaves it unregistered.
+    /// The URI's query parameters advertise the local actions the client supports, such as `supportBluetoothSettings=true`.
+    #[cfg(feature = "w365")]
+    pub virtual_desktop_switch: Option<String>,
+
+    /// Enable the Windows 365 battery status redirection channel.
+    ///
+    /// Supply readings with [`RdpInputEvent::BatteryStatus`](crate::rdp::RdpInputEvent::BatteryStatus).
+    /// Like Windows App, the client does not open the channel in RemoteApp sessions.
+    #[cfg(feature = "w365")]
+    pub battery_status: bool,
+
+    /// Enable the Windows 365 power request redirection channel.
+    ///
+    /// Changes arrive as [`RdpOutputEvent::PowerRequestsChanged`](crate::rdp::RdpOutputEvent::PowerRequestsChanged).
+    #[cfg(feature = "w365")]
+    pub power_request: bool,
+
+    /// Enable the Windows 365 screen capture redirection channel.
+    ///
+    /// Upload screenshots with [`RdpInputEvent::UploadScreenCapture`](crate::rdp::RdpInputEvent::UploadScreenCapture).
+    #[cfg(feature = "w365")]
+    pub screen_capture: bool,
+
+    /// Enable the `Microsoft::Windows::RDS::InteractiveEntraAuth` dynamic virtual channel, through which the session
+    /// host can ask for an interactive Microsoft Entra sign-in during the session.
+    ///
+    /// Off by default, like in Windows App. Requests arrive as
+    /// [`RdpOutputEvent::InteractiveEntraAuthRequested`](crate::rdp::RdpOutputEvent::InteractiveEntraAuthRequested).
+    #[cfg(feature = "entra-auth")]
+    pub interactive_entra_auth: bool,
+
+    /// Enable the MS-RDPEMSC mouse cursor dynamic virtual channel.
+    ///
+    /// Off by default until the channel has been run against a real Windows or AVD server.
+    /// Servers that open the channel send pointer updates on it instead of the fast path, so
+    /// leaving it off keeps them on the fast path.
+    pub mouse_cursor: bool,
+
     /// Maximum number of simultaneous touch contacts advertised in the RDPEI `CS_READY` PDU.
     ///
     /// Defaults to [`RDPEI_MAX_TOUCH_CONTACTS`](crate::rdp::RDPEI_MAX_TOUCH_CONTACTS).
     pub max_touch_contacts: u16,
+
+    /// Send keyboard and mouse input on the MS-RDPECI core input dynamic channel when the server opens it.
+    ///
+    /// Input falls back to fast-path input until the channel's version exchange completes and whenever the channel is absent.
+    /// Off by default, which keeps all input on fast-path input.
+    #[cfg(feature = "core-input")]
+    pub core_input: bool,
 
     /// MS-RDPECAM camera redirection (`camerastoredirect`). No camera is redirected by default.
     #[cfg(feature = "camera")]
@@ -455,6 +525,10 @@ pub struct ChannelConfig {
     /// Local USB devices to redirect over MS-RDPEUSB (URBDRC), or `None` to disable the channel.
     #[cfg(feature = "usb")]
     pub usb: Option<ironrdp_rdpeusb_native::UsbRedirectionConfig>,
+
+    /// Plug and Play devices to redirect over MS-RDPEPNP, or `None` to leave the channels unregistered.
+    #[cfg(feature = "pnp")]
+    pub pnp: Option<crate::pnp::PnpConfig>,
 
     /// H.264 decoder for the graphics pipeline and video optimized remoting.
     ///
@@ -494,13 +568,34 @@ impl Default for ChannelConfig {
             webauthn: true,
             #[cfg(feature = "location")]
             location: false,
+            #[cfg(feature = "telemetry")]
+            telemetry: false,
+            #[cfg(feature = "text-input")]
+            text_input: false,
+            #[cfg(feature = "multipoint")]
+            multipoint: None,
+            #[cfg(feature = "w365")]
+            virtual_desktop_switch: None,
+            #[cfg(feature = "w365")]
+            battery_status: false,
+            #[cfg(feature = "w365")]
+            power_request: false,
+            #[cfg(feature = "w365")]
+            screen_capture: false,
+            #[cfg(feature = "entra-auth")]
+            interactive_entra_auth: false,
+            mouse_cursor: false,
             max_touch_contacts: crate::rdp::RDPEI_MAX_TOUCH_CONTACTS,
+            #[cfg(feature = "core-input")]
+            core_input: false,
             #[cfg(feature = "camera")]
             cameras: crate::camera::CameraConfig::default(),
             #[cfg(feature = "video")]
             video: crate::video::VideoConfig::default(),
             #[cfg(feature = "usb")]
             usb: None,
+            #[cfg(feature = "pnp")]
+            pnp: None,
             h264_decoder: crate::h264::H264DecoderFactory::platform_default(),
             egfx_persistent_cache: None,
         }
@@ -1891,11 +1986,85 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable or disable the MS-RDPEMSC mouse cursor channel.
+    #[must_use]
+    pub fn with_mouse_cursor_channel(mut self, enabled: bool) -> Self {
+        self.channels.mouse_cursor = enabled;
+        self
+    }
+
     /// Enable or disable explicit caller-supplied location redirection.
     #[cfg(feature = "location")]
     #[must_use]
     pub fn with_location_redirection(mut self, enabled: bool) -> Self {
         self.channels.location = enabled;
+        self
+    }
+
+    /// Enable or disable the connection telemetry report.
+    #[cfg(feature = "telemetry")]
+    #[must_use]
+    pub fn with_telemetry(mut self, enabled: bool) -> Self {
+        self.channels.telemetry = enabled;
+        self
+    }
+
+    /// Enable or disable the MS-RDPETXT text input channels.
+    #[cfg(feature = "text-input")]
+    #[must_use]
+    pub fn with_text_input(mut self, enabled: bool) -> Self {
+        self.channels.text_input = enabled;
+        self
+    }
+
+    /// Enable the Windows MultiPoint audio level and drive letter persistence channels with the given settings, or
+    /// disable them with `None`.
+    #[cfg(feature = "multipoint")]
+    #[must_use]
+    pub fn with_multipoint_settings(mut self, settings: Option<crate::multipoint::MultipointSettings>) -> Self {
+        self.channels.multipoint = settings;
+        self
+    }
+
+    /// Enable the Windows 365 virtual desktop control channel with the given launch URI, or disable it with `None`.
+    #[cfg(feature = "w365")]
+    #[must_use]
+    pub fn with_virtual_desktop_switch(mut self, launch_uri: Option<String>) -> Self {
+        self.channels.virtual_desktop_switch = launch_uri;
+        self
+    }
+
+    /// Enable or disable the Windows 365 battery status redirection channel.
+    #[cfg(feature = "w365")]
+    #[must_use]
+    pub fn with_battery_status_redirection(mut self, enabled: bool) -> Self {
+        self.channels.battery_status = enabled;
+        self
+    }
+
+    /// Enable or disable the Windows 365 power request redirection channel.
+    #[cfg(feature = "w365")]
+    #[must_use]
+    pub fn with_power_request_redirection(mut self, enabled: bool) -> Self {
+        self.channels.power_request = enabled;
+        self
+    }
+
+    /// Enable or disable the Windows 365 screen capture redirection channel.
+    #[cfg(feature = "w365")]
+    #[must_use]
+    pub fn with_screen_capture_redirection(mut self, enabled: bool) -> Self {
+        self.channels.screen_capture = enabled;
+        self
+    }
+
+    /// Enable the `Microsoft::Windows::RDS::InteractiveEntraAuth` dynamic virtual channel.
+    ///
+    /// See [`ChannelConfig::interactive_entra_auth`].
+    #[cfg(feature = "entra-auth")]
+    #[must_use]
+    pub fn with_interactive_entra_auth(mut self, enabled: bool) -> Self {
+        self.channels.interactive_entra_auth = enabled;
         self
     }
 
@@ -1915,6 +2084,14 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_max_touch_contacts(mut self, contacts: u16) -> Self {
         self.channels.max_touch_contacts = contacts;
+        self
+    }
+
+    /// Enable or disable sending input on the MS-RDPECI core input dynamic channel.
+    #[must_use]
+    #[cfg(feature = "core-input")]
+    pub fn with_core_input(mut self, enabled: bool) -> Self {
+        self.channels.core_input = enabled;
         self
     }
 
@@ -1952,6 +2129,14 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_usb_redirection(mut self, usb: Option<ironrdp_rdpeusb_native::UsbRedirectionConfig>) -> Self {
         self.channels.usb = usb;
+        self
+    }
+
+    /// Redirect Plug and Play devices over MS-RDPEPNP, or disable PnP redirection with `None`.
+    #[cfg(feature = "pnp")]
+    #[must_use]
+    pub fn with_pnp_redirection(mut self, pnp: Option<crate::pnp::PnpConfig>) -> Self {
+        self.channels.pnp = pnp;
         self
     }
 

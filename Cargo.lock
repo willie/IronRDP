@@ -1455,8 +1455,8 @@ dependencies = [
 
 [[package]]
 name = "diplomat"
-version = "0.16.1"
-source = "git+https://github.com/Devolutions/diplomat?tag=0.16.1-devo.2#002db80cd71327de9553ea01d4d54552d8df05e7"
+version = "0.17.0"
+source = "git+https://github.com/Devolutions/diplomat?tag=0.17.0-devo.1#b1d544ff8c035dea6db0d5f2a98f395b0fd3b293"
 dependencies = [
  "diplomat_core",
  "proc-macro2",
@@ -1466,13 +1466,13 @@ dependencies = [
 
 [[package]]
 name = "diplomat-runtime"
-version = "0.16.0"
-source = "git+https://github.com/Devolutions/diplomat?tag=0.16.1-devo.2#002db80cd71327de9553ea01d4d54552d8df05e7"
+version = "0.16.1"
+source = "git+https://github.com/Devolutions/diplomat?tag=0.17.0-devo.1#b1d544ff8c035dea6db0d5f2a98f395b0fd3b293"
 
 [[package]]
 name = "diplomat_core"
-version = "0.16.1"
-source = "git+https://github.com/Devolutions/diplomat?tag=0.16.1-devo.2#002db80cd71327de9553ea01d4d54552d8df05e7"
+version = "0.17.0"
+source = "git+https://github.com/Devolutions/diplomat?tag=0.17.0-devo.1#b1d544ff8c035dea6db0d5f2a98f395b0fd3b293"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2649,6 +2649,7 @@ dependencies = [
  "ironrdp-server",
  "ironrdp-session",
  "ironrdp-svc",
+ "ironrdp-tls",
  "ironrdp-vmconnect",
  "opus2",
  "pico-args",
@@ -2850,13 +2851,19 @@ dependencies = [
  "ironrdp-propertyset",
  "ironrdp-rail",
  "ironrdp-rdcleanpath",
+ "ironrdp-rdpadrv",
  "ironrdp-rdpdr",
  "ironrdp-rdpeai",
  "ironrdp-rdpecam",
  "ironrdp-rdpecam-native",
+ "ironrdp-rdpeci",
  "ironrdp-rdpegt",
  "ironrdp-rdpei",
  "ironrdp-rdpel",
+ "ironrdp-rdpemsc",
+ "ironrdp-rdpepnp",
+ "ironrdp-rdpet",
+ "ironrdp-rdpetxt",
  "ironrdp-rdpeudp",
  "ironrdp-rdpeudp-tokio",
  "ironrdp-rdpeusb",
@@ -2871,9 +2878,11 @@ dependencies = [
  "ironrdp-tls",
  "ironrdp-tokio",
  "ironrdp-vmconnect",
+ "ironrdp-w365",
  "picky",
  "rand 0.9.5",
  "reqwest",
+ "rstest",
  "rustls-native-certs",
  "serde",
  "serde_json",
@@ -3106,14 +3115,21 @@ dependencies = [
  "ironrdp-egfx",
  "ironrdp-graphics",
  "ironrdp-pdu",
+ "ironrdp-rdpadrv",
  "ironrdp-rdpdr",
  "ironrdp-rdpear",
+ "ironrdp-rdpeci",
  "ironrdp-rdpel",
+ "ironrdp-rdpemsc",
  "ironrdp-rdpemt",
+ "ironrdp-rdpepnp",
+ "ironrdp-rdpet",
+ "ironrdp-rdpetxt",
  "ironrdp-rdpeudp",
  "ironrdp-rdpeusb",
  "ironrdp-rdpsnd",
  "ironrdp-svc",
+ "ironrdp-w365",
 ]
 
 [[package]]
@@ -3227,6 +3243,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-rdpadrv"
+version = "0.0.0"
+dependencies = [
+ "ironrdp-core 0.3.1",
+ "ironrdp-dvc",
+ "ironrdp-pdu",
+ "tracing",
+]
+
+[[package]]
 name = "ironrdp-rdpdr"
 version = "0.9.0"
 dependencies = [
@@ -3297,6 +3323,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-rdpeci"
+version = "0.0.0"
+dependencies = [
+ "ironrdp-core 0.3.1",
+ "ironrdp-dvc",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "tracing",
+]
+
+[[package]]
 name = "ironrdp-rdpegt"
 version = "0.2.0"
 dependencies = [
@@ -3319,6 +3356,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-rdpei-native"
+version = "0.0.0"
+dependencies = [
+ "futures-timer",
+ "ironrdp-error 0.2.1",
+ "ironrdp-rdpei",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "ironrdp-rdpel"
 version = "0.0.2"
 dependencies = [
@@ -3330,6 +3378,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-rdpemsc"
+version = "0.0.0"
+dependencies = [
+ "ironrdp-core 0.3.1",
+ "ironrdp-dvc",
+ "ironrdp-pdu",
+ "tracing",
+]
+
+[[package]]
 name = "ironrdp-rdpemt"
 version = "0.1.0"
 dependencies = [
@@ -3337,6 +3395,41 @@ dependencies = [
  "ironrdp-core 0.3.1",
  "ironrdp-error 0.2.1",
  "subtle",
+ "tracing",
+]
+
+[[package]]
+name = "ironrdp-rdpepnp"
+version = "0.1.0"
+dependencies = [
+ "ironrdp-core 0.3.1",
+ "ironrdp-dvc",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "spin",
+ "tracing",
+]
+
+[[package]]
+name = "ironrdp-rdpet"
+version = "0.1.0"
+dependencies = [
+ "ironrdp-core 0.3.1",
+ "ironrdp-dvc",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "tracing",
+]
+
+[[package]]
+name = "ironrdp-rdpetxt"
+version = "0.0.0"
+dependencies = [
+ "ironrdp-core 0.3.1",
+ "ironrdp-dvc",
+ "ironrdp-pdu",
+ "ironrdp-str",
+ "ironrdp-svc",
  "tracing",
 ]
 
@@ -3602,14 +3695,20 @@ dependencies = [
  "ironrdp-pdu",
  "ironrdp-propertyset",
  "ironrdp-rdcleanpath",
+ "ironrdp-rdpadrv",
  "ironrdp-rdpdr",
  "ironrdp-rdpeai",
  "ironrdp-rdpear",
  "ironrdp-rdpecam",
+ "ironrdp-rdpeci",
  "ironrdp-rdpegt",
  "ironrdp-rdpei",
  "ironrdp-rdpel",
+ "ironrdp-rdpemsc",
  "ironrdp-rdpemt",
+ "ironrdp-rdpepnp",
+ "ironrdp-rdpet",
+ "ironrdp-rdpetxt",
  "ironrdp-rdpeudp",
  "ironrdp-rdpeusb",
  "ironrdp-rdpevor",
@@ -3621,6 +3720,7 @@ dependencies = [
  "ironrdp-svc",
  "ironrdp-tokio",
  "ironrdp-usb",
+ "ironrdp-w365",
  "openh264",
  "paste",
  "png",
@@ -3659,10 +3759,15 @@ dependencies = [
  "ironrdp-pdu",
  "ironrdp-propertyset",
  "ironrdp-rail",
+ "ironrdp-rdpadrv",
  "ironrdp-rdpdr",
  "ironrdp-rdpdr-native",
  "ironrdp-rdpeai",
+ "ironrdp-rdpeci",
+ "ironrdp-rdpei",
+ "ironrdp-rdpei-native",
  "ironrdp-rdpemt",
+ "ironrdp-rdpet",
  "ironrdp-rdpeudp",
  "ironrdp-rdpeudp-tokio",
  "ironrdp-rdpsnd",
@@ -3760,6 +3865,17 @@ dependencies = [
  "tracing",
  "windows",
  "windows-registry",
+]
+
+[[package]]
+name = "ironrdp-w365"
+version = "0.1.0"
+dependencies = [
+ "ironrdp-core 0.3.1",
+ "ironrdp-dvc",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "tracing",
 ]
 
 [[package]]
@@ -4044,9 +4160,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.34"
+version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "lru-slab"
@@ -5060,6 +5176,7 @@ dependencies = [
  "sha2 0.11.1",
  "sha3",
  "thiserror 2.0.21",
+ "time",
  "x25519-dalek",
  "zeroize",
 ]
@@ -8316,9 +8433,9 @@ dependencies = [
 
 [[package]]
 name = "yuv"
-version = "0.8.19"
+version = "0.8.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a295923535c00a4e72a50a0a1130097f93160b39892dd4d2d006b1e2b90d6bf9"
+checksum = "3d109d1eacc7b034329873d2d848039b365c65ab7d751b19ee84e4921c62c607"
 dependencies = [
  "num-traits",
 ]
