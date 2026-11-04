@@ -289,11 +289,6 @@ pub fn tests_compile(sh: &Shell) -> anyhow::Result<()> {
     .run()?;
     cmd!(
         sh,
-        "{CARGO} test -p ironrdp-graphics --lib --features rayon --locked --no-run"
-    )
-    .run()?;
-    cmd!(
-        sh,
         "{CARGO} test -p ironrdp-rdpeudp-tokio --features ice --locked --no-run"
     )
     .run()?;
@@ -310,6 +305,11 @@ pub fn tests_compile(sh: &Shell) -> anyhow::Result<()> {
     cmd!(
         sh,
         "{CARGO} test -p ironrdp-testsuite-extra --features remote-guard --locked --no-run"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "{CARGO} test -p ironrdp-graphics --lib --features rayon --locked --no-run"
     )
     .run()?;
     println!("All good!");
@@ -344,7 +344,6 @@ pub fn tests_run(sh: &Shell) -> anyhow::Result<()> {
         "{CARGO} test -p ironrdp-mstsgu --test http_auth --features native-tls,smartcard --locked"
     )
     .run()?;
-    cmd!(sh, "{CARGO} test -p ironrdp-graphics --lib --features rayon --locked").run()?;
     cmd!(sh, "{CARGO} test -p ironrdp-rdpeudp-tokio --features ice --locked").run()?;
     cmd!(
         sh,
@@ -361,6 +360,7 @@ pub fn tests_run(sh: &Shell) -> anyhow::Result<()> {
         "{CARGO} test -p ironrdp-testsuite-extra --features remote-guard --locked -- client::remote_guard"
     )
     .run()?;
+    cmd!(sh, "{CARGO} test -p ironrdp-graphics --lib --features rayon --locked").run()?;
     println!("All good!");
     Ok(())
 }
